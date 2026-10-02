@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import aiohttp
+import mail
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -508,6 +509,10 @@ async def main():
     owner_id = me.id
     log.info("Запущен как %s (id %s), база %s", display_name(me), me.id, DB_PATH)
     asyncio.create_task(cleanup_loop())
+    if mail.ENABLED:
+        mail.start(http, db, owner_id, BOT_TOKEN)
+    else:
+        log.info("Почта выключена: нет GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN")
     try:
         await client.run_until_disconnected()
     finally:

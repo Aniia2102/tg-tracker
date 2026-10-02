@@ -4,37 +4,40 @@
     pip3 install google-auth-oauthlib
     python3 gen_gmail_token.py
 
-Перед запуском положи рядом файл client_secret.json, скачанный из
-Google Cloud (OAuth client, тип Desktop app).
-
-Откроется браузер: войди в ilinaanna001@gmail.com и разреши доступ.
-Если Google напишет «Приложение не проверено» — нажми
-«Дополнительно» → «Перейти на страницу …» (это твоё же приложение).
-
-Скрипт напечатает три значения — впиши их в Railway → Variables:
-  GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN
-Никому их не показывай — это доступ к твоей почте.
+1. Скрипт спросит Client ID и Client Secret из Google Cloud.
+2. Откроется браузер — войди в нужный Gmail и разреши доступ.
+   Если Google пишет «Приложение не проверено» — нажми
+   «Дополнительно» → «Перейти на страницу …» (это твоё же приложение).
+3. Скрипт напечатает три значения — вставь их в Variables на Railway:
+   GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN.
+   Никому их не показывай: это доступ к твоей почте.
 """
-
-import json
-from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-# чтение, пометки (звёздочка), перемещение в Корзину. Безвозвратно удалять не может.
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
-secret = Path(__file__).with_name("client_secret.json")
-if not secret.exists():
-    raise SystemExit(f"Не нашла {secret}. Скачай его из Google Cloud и положи рядом со скриптом.")
+client_id = input("Client ID: ").strip()
+client_secret = input("Client Secret: ").strip()
 
-flow = InstalledAppFlow.from_client_secrets_file(str(secret), SCOPES)
-creds = flow.run_local_server(port=0, prompt="consent", access_type="offline")
+flow = InstalledAppFlow.from_client_config(
+    {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"],
+        }
+    },
+    SCOPES,
+)
+creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
 
-info = json.loads(secret.read_text())
-client = info.get("installed") or info.get("web")
+if not creds.refresh_token:
+    raise SystemExit("Google не выдал refresh token — запусти скрипт ещё раз.")
 
-print("\nВпиши в Railway → Variables:\n")
-print(f"GMAIL_CLIENT_ID={client['client_id']}")
-print(f"GMAIL_CLIENT_SECRET={client['client_secret']}")
+print("\nГотово! Вставь в Railway → Variables:\n")
+print(f"GMAIL_CLIENT_ID={client_id}")
+print(f"GMAIL_CLIENT_SECRET={client_secret}")
 print(f"GMAIL_REFRESH_TOKEN={creds.refresh_token}")
