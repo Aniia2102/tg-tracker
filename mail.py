@@ -162,21 +162,63 @@ async def access_token() -> str:
     return _token["value"]
 
 
+def _rate_limited(status: int, data) -> bool:
+    text = json.dumps(data) if not isinstance(data, str) else data
+    return status == 429 or (status == 403 and ("rateLimitExceeded" in text or "Quota exceeded" in text))
+
+
 async def gmail(method: str, path: str, **kw):
-    for attempt in range(4):
+    for attempt in range(6):
         headers = {"Authorization": f"Bearer {await access_token()}"}
         async with http.request(method, API + path, headers=headers, **kw) as r:
-            if r.status in (429, 500, 503):
+            if r.status in (500, 502, 503):
                 await asyncio.sleep(2 ** attempt)
                 continue
             if r.status == 401:
                 _token["value"] = ""
                 continue
             data = await r.json(content_type=None) if r.content_length != 0 else {}
+            if _rate_limited(r.status, data):
+                # лимит Gmail в минуту — ждём и повторяем
+                log.info("Лимит Gmail, жду %s c", 20 * (attempt + 1))
+                await asyncio.sleep(20 * (attempt + 1))
+                continue
             if r.status >= 400:
                 raise RuntimeError(f"Gmail {r.status}: {data}")
             return data or {}
     raise RuntimeError("Gmail: слишком много повторов")
+
+
+async def list_messages(query: str) -> list[str]:
+    ids, page = [], None
+    while True:
+        params = {"q": query, "maxResults": 500, "includeSpamTrash": "true"}
+        if page:
+            params["pageToken"] = page
+        data = await gmail("GET", "/messages", params=params)
+        ids += [m["id"] for m in data.get("messages", [])]
+        page = data.get("nextPageToken")
+        if not page:
+            return ids
+
+
+async def trash_messages(ids: list[str], progress=None) -> int:
+    """Массово в Корзину: пачками по 1000 писем за один запрос."""
+    done = 0
+    for i in range(0, len(ids), 1000):
+        chunk = ids[i : i + 1000]
+        try:
+            await gmail(
+                "POST",
+                "/messages/batchModify",
+                json={"ids": chunk, "addLabelIds": ["TRASH"], "removeLabelIds": ["INBOX", "SPAM"]},
+            )
+            done += len(chunk)
+        except Exception as e:
+            log.warning("batchModify: %s", e)
+        if progress:
+            await progress(done, len(ids))
+    return done
 
 
 async def list_threads(query: str, limit: int | None = None) -> list[str]:
@@ -366,10 +408,11 @@ async def send_digest(limit: int = DIGEST_LIMIT, header: str = "") -> int:
 # ---------------------------------------------------------------- чистка
 
 async def find_junk() -> tuple[dict[str, int], list[str]]:
+    """Письма (не цепочки) под удаление — по правилам, без повторов."""
     counts, all_ids = {}, []
     seen = set()
     for name, q in RULES:
-        ids = [t for t in await list_threads(rule_query(q)) if t not in seen]
+        ids = [m for m in await list_messages(rule_query(q)) if m not in seen]
         seen.update(ids)
         counts[name] = len(ids)
         all_ids += ids
@@ -389,10 +432,10 @@ async def cleanup_preview() -> None:
         "sendMessage",
         chat_id=owner_id,
         text=(
-            f"🧹 Первая чистка почты. Нашла к удалению {len(ids)} цепочек писем:\n\n"
+            f"🧹 Чистка почты. Нашла к удалению {len(ids)} писем:\n\n"
             f"{counts_text(counts)}\n\n"
-            "Не трогаю: ממריאות, отмеченные ⭐, письма от вузов и College Board, чеки — "
-            "они придут в сводку.\nУдалённое лежит в Корзине Gmail 30 дней."
+            "Не трогаю: ממריאות, отмеченные ⭐, письма от вузов и College Board, счета, чеки "
+            "и билеты — они придут в сводку.\nУдалённое лежит в Корзине Gmail 30 дней."
         ),
         reply_markup={
             "inline_keyboard": [[{"text": f"🗑 Удалить {len(ids)}", "callback_data": "clean"}]]
@@ -400,19 +443,53 @@ async def cleanup_preview() -> None:
     )
 
 
-async def run_cleanup() -> tuple[int, dict[str, int]]:
+async def run_cleanup(report: bool = False) -> tuple[int, int, dict[str, int]]:
+    """Удалить мусор. report=True — показывать прогресс и итог в Telegram."""
+    if _cleaning.locked():
+        if report:
+            await tg("sendMessage", chat_id=owner_id, text="🧹 Чистка уже идёт — пришлю итог, когда закончу.")
+        return 0, 0, {}
+    async with _cleaning:
+        return await _run_cleanup(report)
+
+
+async def _run_cleanup(report: bool) -> tuple[int, int, dict[str, int]]:
+    status_msg = None
+    if report:
+        status_msg = await tg("sendMessage", chat_id=owner_id, text="🧹 Ищу письма для удаления…")
     counts, ids = await find_junk()
-    n = await trash_many(ids) if ids else 0
-    return n, counts
+
+    async def progress(done, total):
+        if status_msg:
+            await tg(
+                "editMessageText",
+                chat_id=owner_id,
+                message_id=status_msg["message_id"],
+                text=f"🧹 Удаляю… {done} из {total}",
+            )
+
+    n = await trash_messages(ids, progress) if ids else 0
+    failed = len(ids) - n
+    if report:
+        if not ids:
+            text = "✅ Готово: удалять нечего, всё чисто."
+        else:
+            text = f"✅ Готово! Удалила {n} писем.\n\n{counts_text(counts)}"
+            if failed:
+                text += f"\n\n⚠️ Не удалось удалить {failed} — попробую снова при следующей чистке."
+        await tg("editMessageText", chat_id=owner_id, message_id=status_msg["message_id"], text=text)
+    return n, failed, counts
 
 
 async def evening() -> None:
     """Ежедневный запуск: чистка (если уже разрешена) + сводка."""
     header = ""
     if kv_get("auto_cleanup") == "1":
-        n, counts = await run_cleanup()
+        n, failed, counts = await run_cleanup()
         if n:
-            header = f"🧹 Сегодня удалила {n} ненужных:\n{counts_text(counts)}\n\n"
+            header = f"🧹 Сегодня удалила {n} ненужных писем:\n{counts_text(counts)}\n\n"
+        if failed:
+            header += f"⚠️ Не удалось удалить {failed}.\n\n"
     await send_digest(header=header)
 
 
@@ -451,17 +528,18 @@ async def on_callback(cb: dict) -> None:
     if data == "clean":
         await answer(cb["id"], "Удаляю…")
         await tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup={"inline_keyboard": []})
-        n, counts = await run_cleanup()
+        first = kv_get("auto_cleanup") != "1"
+        await run_cleanup(report=True)
         kv_set("auto_cleanup", "1")
-        await tg(
-            "sendMessage",
-            chat_id=owner_id,
-            text=(
-                f"✅ Удалила {n} цепочек писем.\n\n{counts_text(counts)}\n\n"
-                f"Дальше буду чистить по этим правилам сама каждый вечер в {DIGEST_HOUR}:00 "
-                "и присылать сводку того, что под вопросом."
-            ),
-        )
+        if first:
+            await tg(
+                "sendMessage",
+                chat_id=owner_id,
+                text=(
+                    f"Дальше буду чистить по этим правилам сама каждый вечер в {DIGEST_HOUR}:00 "
+                    "и присылать сводку того, что под вопросом. Вот первая порция:"
+                ),
+            )
         await send_digest()
         return
 
@@ -536,12 +614,29 @@ async def on_message(m: dict) -> None:
         await send_digest()
     elif text == "/cleanup":
         if kv_get("auto_cleanup") == "1":
-            n, counts = await run_cleanup()
-            await tg("sendMessage", chat_id=owner_id, text=f"🧹 Удалила {n}.\n{counts_text(counts)}".strip())
+            await run_cleanup(report=True)
         else:
             await cleanup_preview()
     elif text in ("/start", "/help"):
         await tg("sendMessage", chat_id=owner_id, text=HELP)
+
+
+_bg: set[asyncio.Task] = set()
+_cleaning = asyncio.Lock()
+
+
+async def handle_update(upd: dict) -> None:
+    try:
+        if "callback_query" in upd:
+            cb = upd["callback_query"]
+            if cb["from"]["id"] == owner_id:
+                await on_callback(cb)
+        elif "message" in upd and upd["message"].get("from", {}).get("id") == owner_id:
+            await on_message(upd["message"])
+    except GmailAuthError as e:
+        await auth_problem(e)
+    except Exception:
+        log.exception("update")
 
 
 async def updates_loop() -> None:
@@ -558,17 +653,9 @@ async def updates_loop() -> None:
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 kv_set("tg_offset", offset)
-                try:
-                    if "callback_query" in upd:
-                        cb = upd["callback_query"]
-                        if cb["from"]["id"] == owner_id:
-                            await on_callback(cb)
-                    elif "message" in upd and upd["message"].get("from", {}).get("id") == owner_id:
-                        await on_message(upd["message"])
-                except GmailAuthError as e:
-                    await auth_problem(e)
-                except Exception:
-                    log.exception("update")
+                # каждое нажатие — отдельной задачей, чтобы долгая чистка не блокировала кнопки
+                _bg.add(t := asyncio.create_task(handle_update(upd)))
+                t.add_done_callback(_bg.discard)
         except asyncio.CancelledError:
             raise
         except Exception as e:
