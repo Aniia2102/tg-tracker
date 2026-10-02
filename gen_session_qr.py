@@ -17,8 +17,8 @@ import asyncio
 import getpass
 
 import qrcode
-from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon import TelegramClient, functions
+from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 
 
@@ -26,6 +26,26 @@ def show_qr(url: str) -> None:
     qr = qrcode.QRCode(border=1)
     qr.add_data(url)
     qr.print_ascii(invert=True)
+
+
+async def enter_password(client: TelegramClient) -> None:
+    info = await client(functions.account.GetPasswordRequest())
+    print("\nНа аккаунте включена двухэтапная проверка (облачный пароль).")
+    if info.hint:
+        print(f"Подсказка к паролю: {info.hint}")
+    print("При вводе символы НЕ отображаются — это нормально, просто печатай и жми Enter.")
+    for attempt in range(3, 0, -1):
+        password = getpass.getpass("Облачный пароль: ")
+        try:
+            await client.sign_in(password=password)
+            return
+        except PasswordHashInvalidError:
+            if attempt > 1:
+                print(f"Неверный пароль. Осталось попыток: {attempt - 1}")
+    raise SystemExit(
+        "Пароль не подошёл. Проверь его в Telegram → Настройки → Конфиденциальность → "
+        "Облачный пароль и запусти скрипт ещё раз."
+    )
 
 
 async def main() -> None:
@@ -46,7 +66,7 @@ async def main() -> None:
             print("\nQR устарел, показываю новый…")
             await qr_login.recreate()
         except SessionPasswordNeededError:
-            await client.sign_in(password=getpass.getpass("Облачный пароль (2FA): "))
+            await enter_password(client)
             break
 
     me = await client.get_me()
