@@ -525,6 +525,23 @@ async def on_callback(cb: dict) -> None:
     msg = cb.get("message") or {}
     chat_id, msg_id = msg.get("chat", {}).get("id"), msg.get("message_id")
 
+    if data == "ar":
+        on = kv_get("auto_read") != "1"
+        kv_set("auto_read", "1" if on else "0")
+        await answer(cb["id"], "Автопрочтение включено" if on else "Автопрочтение выключено")
+        await show_settings(edit_msg_id=msg_id)
+        if on:
+            await mark_all_read(report=False)
+        return
+    if data == "dig":
+        await answer(cb["id"])
+        await send_digest()
+        return
+    if data == "cl":
+        await answer(cb["id"])
+        await do_cleanup()
+        return
+
     if data == "clean":
         await answer(cb["id"], "Удаляю…")
         await tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup={"inline_keyboard": []})
@@ -601,24 +618,134 @@ async def on_callback(cb: dict) -> None:
         await answer(cb["id"])
 
 
-HELP = (
-    "Команды почты:\n"
-    "/digest — прислать следующую порцию писем на разбор\n"
-    "/cleanup — проверить, что удалится по правилам"
-)
+# ---------------------------------------------------------------- меню и «прочитать всё»
+
+BTN_DIGEST = "📬 Письма на разбор"
+BTN_CLEAN = "🧹 Почистить почту"
+BTN_READ = "📖 Прочитать всё"
+BTN_SETTINGS = "⚙️ Настройки"
+
+MENU_KB = {
+    "keyboard": [[{"text": BTN_DIGEST}, {"text": BTN_CLEAN}], [{"text": BTN_READ}, {"text": BTN_SETTINGS}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+    "input_field_placeholder": "Выбери действие 👇",
+}
+
+COMMANDS = [
+    {"command": "menu", "description": "Показать меню"},
+    {"command": "digest", "description": "Письма на разбор"},
+    {"command": "cleanup", "description": "Почистить почту"},
+    {"command": "readall", "description": "Отметить всё прочитанным"},
+    {"command": "settings", "description": "Настройки"},
+]
+
+AUTO_READ_EVERY = 10 * 60  # секунд
+
+
+async def mark_all_read(report: bool = True) -> int:
+    ids = await list_messages("in:inbox is:unread")
+    done = 0
+    for i in range(0, len(ids), 1000):
+        chunk = ids[i : i + 1000]
+        try:
+            await gmail("POST", "/messages/batchModify", json={"ids": chunk, "removeLabelIds": ["UNREAD"]})
+            done += len(chunk)
+        except Exception as e:
+            log.warning("mark read: %s", e)
+    if report:
+        text = f"📖 Готово! Отметила прочитанными {done} писем." if ids else "📖 Непрочитанных писем нет."
+        if len(ids) > done:
+            text += f"\n⚠️ Не получилось с {len(ids) - done} — попробуй ещё раз позже."
+        await tg("sendMessage", chat_id=owner_id, text=text, reply_markup=MENU_KB)
+    return done
+
+
+def stats_text() -> str:
+    row = db.execute(
+        "SELECT SUM(status='kept'), SUM(status='trashed'), SUM(status='sent') FROM gmail_items"
+    ).fetchone()
+    kept, trashed, waiting = (x or 0 for x in row)
+    return f"⭐ оставлено: {kept}   🗑 удалено из сводки: {trashed}   ⏳ без ответа: {waiting}"
+
+
+def settings_view() -> tuple[str, dict]:
+    auto_read = kv_get("auto_read") == "1"
+    auto_clean = kv_get("auto_cleanup") == "1"
+    text = (
+        "⚙️ <b>Настройки почты</b>\n\n"
+        f"🕖 Сводка и чистка: каждый день в {DIGEST_HOUR:02d}:00\n"
+        f"🧹 Автоматическая чистка: {'✅ включена' if auto_clean else '⏸ ждёт первого подтверждения'}\n"
+        f"📖 Автопрочтение новых писем: {'✅ включено' if auto_read else '⏸ выключено'}\n"
+        + ("   (каждые 10 минут всё во «Входящих» отмечается прочитанным)\n" if auto_read else "")
+        + f"\n{stats_text()}"
+    )
+    kb = {
+        "inline_keyboard": [
+            [{"text": ("⏸ Выключить автопрочтение" if auto_read else "✅ Включить автопрочтение"), "callback_data": "ar"}],
+            [{"text": "📬 Прислать письма сейчас", "callback_data": "dig"}, {"text": "🧹 Почистить", "callback_data": "cl"}],
+        ]
+    }
+    return text, kb
+
+
+async def show_settings(edit_msg_id: int | None = None) -> None:
+    text, kb = settings_view()
+    if edit_msg_id:
+        await tg("editMessageText", chat_id=owner_id, message_id=edit_msg_id, text=text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await tg("sendMessage", chat_id=owner_id, text=text, parse_mode="HTML", reply_markup=kb)
+
+
+async def show_menu() -> None:
+    await tg(
+        "sendMessage",
+        chat_id=owner_id,
+        text=(
+            "👋 Меню почты\n\n"
+            f"{BTN_DIGEST} — следующая порция писем с кнопками ⭐ / 🗑 / 📖\n"
+            f"{BTN_CLEAN} — удалить промо, коды, рассылки и прочий мусор\n"
+            f"{BTN_READ} — отметить все входящие прочитанными\n"
+            f"{BTN_SETTINGS} — автопрочтение и статистика\n\n"
+            f"Каждый вечер в {DIGEST_HOUR:02d}:00 сводка приходит сама."
+        ),
+        reply_markup=MENU_KB,
+    )
+
+
+async def do_cleanup() -> None:
+    if kv_get("auto_cleanup") == "1":
+        await run_cleanup(report=True)
+    else:
+        await cleanup_preview()
 
 
 async def on_message(m: dict) -> None:
     text = (m.get("text") or "").strip().split("@")[0]
-    if text == "/digest":
+    if text in ("/digest", BTN_DIGEST):
         await send_digest()
-    elif text == "/cleanup":
-        if kv_get("auto_cleanup") == "1":
-            await run_cleanup(report=True)
-        else:
-            await cleanup_preview()
-    elif text in ("/start", "/help"):
-        await tg("sendMessage", chat_id=owner_id, text=HELP)
+    elif text in ("/cleanup", BTN_CLEAN):
+        await do_cleanup()
+    elif text in ("/readall", BTN_READ):
+        await mark_all_read()
+    elif text in ("/settings", BTN_SETTINGS):
+        await show_settings()
+    elif text in ("/start", "/help", "/menu"):
+        await show_menu()
+
+
+async def auto_read_loop() -> None:
+    while True:
+        await asyncio.sleep(AUTO_READ_EVERY)
+        if kv_get("auto_read") == "1":
+            try:
+                n = await mark_all_read(report=False)
+                if n:
+                    log.info("Автопрочтение: %d писем", n)
+            except GmailAuthError as e:
+                await auth_problem(e)
+            except Exception:
+                log.exception("auto_read")
 
 
 _bg: set[asyncio.Task] = set()
@@ -708,4 +835,24 @@ def start(session: aiohttp.ClientSession, database: sqlite3.Connection, owner: i
     http, db, owner_id, bot_token = session, database, owner, token
     init_db()
     log.info("Почта включена: сводка в %02d:00 (%s)", DIGEST_HOUR, TZ.key)
-    return [asyncio.create_task(updates_loop()), asyncio.create_task(scheduler_loop())]
+    return [
+        asyncio.create_task(updates_loop()),
+        asyncio.create_task(scheduler_loop()),
+        asyncio.create_task(auto_read_loop()),
+        asyncio.create_task(setup_menu()),
+    ]
+
+
+async def setup_menu() -> None:
+    """Команды в кнопке «Меню» Telegram; меню с кнопками — один раз после обновления."""
+    try:
+        await tg("setMyCommands", commands=COMMANDS)
+        await tg("setChatMenuButton", chat_id=owner_id, menu_button={"type": "commands"})
+        if kv_get("menu_shown") != "1":
+            await show_menu()
+            kv_set("menu_shown", "1")
+        if kv_get("initial_read") != "1":
+            kv_set("initial_read", "1")
+            await mark_all_read()
+    except Exception:
+        log.exception("setup_menu")
