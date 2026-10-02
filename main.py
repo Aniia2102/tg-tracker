@@ -478,6 +478,11 @@ async def main():
     if not await client.is_user_authorized():
         raise SystemExit("SESSION недействительна — сгенерируй новую через gen_session.py")
     me = await client.get_me()
+    if me.bot:
+        raise SystemExit(
+            "SESSION принадлежит боту, а нужен личный аккаунт — "
+            "сгенерируй её заново через gen_session_qr.py"
+        )
     owner_id = me.id
     log.info("Запущен как %s (id %s), база %s", display_name(me), me.id, DB_PATH)
     asyncio.create_task(cleanup_loop())
