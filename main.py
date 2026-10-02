@@ -1,14 +1,18 @@
 """
 tg-tracker — юзербот, который присылает через отдельного бота
 удалённые и изменённые сообщения из личных чатов и групп.
-Свои сообщения не отслеживаются.
+Свои сообщения не отслеживаются. Фото, голосовые, кружки, видео,
+аудио и файлы сохраняются и при удалении присылаются сами.
 
 Переменные окружения:
-  API_ID, API_HASH   — с my.telegram.org
-  SESSION            — StringSession (получить через gen_session.py)
-  BOT_TOKEN          — токен бота-уведомителя от @BotFather
-  DB_PATH            — путь к базе (по умолчанию /data/tracker.db)
-  RETENTION_DAYS     — сколько дней хранить сообщения (по умолчанию 30)
+  API_ID, API_HASH      — с my.telegram.org
+  SESSION               — StringSession (получить через gen_session.py)
+  BOT_TOKEN             — токен бота-уведомителя от @BotFather
+  DB_PATH               — путь к базе (по умолчанию /data/tracker.db)
+  RETENTION_DAYS        — сколько дней хранить текст (по умолчанию 30)
+  MEDIA_RETENTION_DAYS  — сколько дней хранить медиа (по умолчанию 7)
+  MEDIA_MAX_MB          — не скачивать файлы больше (по умолчанию 20)
+  MEDIA_IN_GROUPS       — 1/0: сохранять медиа из групп (по умолчанию 1)
 """
 
 import asyncio
@@ -43,14 +47,31 @@ SESSION = os.environ["SESSION"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "/data/tracker.db")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
+MEDIA_RETENTION_DAYS = int(os.environ.get("MEDIA_RETENTION_DAYS", "7"))
+MEDIA_MAX_BYTES = int(float(os.environ.get("MEDIA_MAX_MB", "20")) * 1024 * 1024)
+MEDIA_IN_GROUPS = os.environ.get("MEDIA_IN_GROUPS", "1") == "1"
 
-MAX_LEN = 4000  # лимит Telegram — 4096 символов
+MEDIA_DIR = Path(DB_PATH).parent / "media"
+MAX_LEN = 4000  # лимит текста — 4096
+MAX_CAPTION = 1000  # лимит подписи к файлу — 1024
+
+# какой метод Bot API использовать для какого типа медиа
+SEND_METHOD = {
+    "photo": ("sendPhoto", "photo"),
+    "voice": ("sendVoice", "voice"),
+    "video_note": ("sendVideoNote", "video_note"),
+    "video": ("sendVideo", "video"),
+    "audio": ("sendAudio", "audio"),
+    "gif": ("sendAnimation", "animation"),
+    "document": ("sendDocument", "document"),
+}
 
 # ---------------------------------------------------------------- база
 
 
 def open_db() -> sqlite3.Connection:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute(
@@ -65,6 +86,8 @@ def open_db() -> sqlite3.Connection:
             username    TEXT,
             text        TEXT,
             created     INTEGER NOT NULL,
+            media_kind  TEXT,               -- photo / voice / video_note / ...
+            media_path  TEXT,               -- путь к скачанному файлу
             PRIMARY KEY (chat_id, msg_id)
         )
         """
@@ -77,6 +100,28 @@ def open_db() -> sqlite3.Connection:
 db = open_db()
 
 # ---------------------------------------------------------------- утилиты
+
+
+def media_kind(msg) -> str | None:
+    """Тип медиа, которое имеет смысл скачать и потом переслать."""
+    m = msg.media
+    if isinstance(m, MessageMediaPhoto):
+        return "photo"
+    if isinstance(m, MessageMediaDocument):
+        if msg.sticker:
+            return None
+        if msg.voice:
+            return "voice"
+        if msg.video_note:
+            return "video_note"
+        if msg.gif:
+            return "gif"
+        if msg.video:
+            return "video"
+        if msg.audio:
+            return "audio"
+        return "document"
+    return None
 
 
 def media_label(msg) -> str:
@@ -114,6 +159,11 @@ def message_text(msg) -> str:
     return f"{label} {text}".strip() if label else text
 
 
+def media_size(msg) -> int:
+    f = msg.file
+    return (f.size or 0) if f else 0
+
+
 def display_name(user) -> str:
     if user is None:
         return "Неизвестный"
@@ -140,35 +190,78 @@ def clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def remove_file(path: str | None) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
 # ---------------------------------------------------------------- отправка через бота
 
 http: aiohttp.ClientSession | None = None
 owner_id: int = 0
 
 
-async def notify(text: str) -> None:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": owner_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+async def bot_call(method: str, *, json=None, file_field=None, file_path=None, fields=None) -> bool:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     for attempt in range(3):
         try:
-            async with http.post(url, json=payload) as r:
-                data = await r.json()
-                if data.get("ok"):
-                    return
-                retry = data.get("parameters", {}).get("retry_after")
-                if retry:
-                    await asyncio.sleep(retry)
-                    continue
-                log.error("Bot API: %s", data)
-                return
+            if file_path:
+                form = aiohttp.FormData()
+                for k, v in (fields or {}).items():
+                    form.add_field(k, str(v))
+                with open(file_path, "rb") as fh:
+                    form.add_field(file_field, fh, filename=Path(file_path).name)
+                    async with http.post(url, data=form) as r:
+                        data = await r.json()
+            else:
+                async with http.post(url, json=json) as r:
+                    data = await r.json()
+            if data.get("ok"):
+                return True
+            retry = data.get("parameters", {}).get("retry_after")
+            if retry:
+                await asyncio.sleep(retry)
+                continue
+            log.error("Bot API %s: %s", method, data)
+            return False
         except Exception as e:  # сеть
-            log.warning("Ошибка отправки (%s), попытка %d", e, attempt + 1)
+            log.warning("Ошибка %s (%s), попытка %d", method, e, attempt + 1)
             await asyncio.sleep(2)
+    return False
+
+
+async def notify(text: str) -> None:
+    await bot_call(
+        "sendMessage",
+        json={
+            "chat_id": owner_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+    )
+
+
+async def notify_media(kind: str, path: str, caption: str) -> bool:
+    """Отправить сохранённый файл. Подпись — если влезает в лимит."""
+    method, field = SEND_METHOD.get(kind, SEND_METHOD["document"])
+    fields = {"chat_id": owner_id}
+    long_caption = len(caption) > MAX_CAPTION
+    # у кружков подписи не бывает
+    if kind != "video_note" and not long_caption:
+        fields.update(caption=caption, parse_mode="HTML")
+    else:
+        await notify(caption)
+    ok = await bot_call(method, file_field=field, file_path=path, fields=fields)
+    if not ok and kind != "document":
+        # например, голосовое в неподходящем формате — шлём как файл
+        ok = await bot_call(
+            "sendDocument", file_field="document", file_path=path, fields=fields
+        )
+    return ok
 
 
 # ---------------------------------------------------------------- клиент
@@ -189,7 +282,26 @@ async def should_track(event) -> bool:
     return event.is_group
 
 
-async def save(event) -> None:
+async def download_media(event, kind: str) -> None:
+    """Скачать медиа в фоне и записать путь в базу."""
+    msg = event.message
+    try:
+        base = MEDIA_DIR / f"{event.chat_id}_{msg.id}"
+        path = await client.download_media(msg, file=str(base))
+        if not path:
+            return
+        cur = db.execute(
+            "UPDATE messages SET media_path=? WHERE chat_id=? AND msg_id=?",
+            (path, event.chat_id, msg.id),
+        )
+        db.commit()
+        if cur.rowcount == 0:
+            remove_file(path)  # сообщение уже удалили, пока качали
+    except Exception:
+        log.exception("download_media")
+
+
+async def save(event, *, with_media: bool = True) -> None:
     msg = event.message
     sender = await event.get_sender()
     chat = await event.get_chat()
@@ -198,11 +310,25 @@ async def save(event) -> None:
     if isinstance(sender, User):
         name, username = display_name(sender), sender.username
     else:  # сообщение от имени канала/группы
-        name, username = getattr(sender, "title", "Неизвестный"), getattr(
-            sender, "username", None
-        )
+        name = getattr(sender, "title", None) or "Неизвестный"
+        username = getattr(sender, "username", None)
+
+    kind = media_kind(msg) if with_media else None
+    if kind and (
+        media_size(msg) > MEDIA_MAX_BYTES or (event.is_group and not MEDIA_IN_GROUPS)
+    ):
+        kind = None
+
     db.execute(
-        "INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
+        """
+        INSERT INTO messages
+            (chat_id, msg_id, is_channel, chat_title, sender_id, sender_name,
+             username, text, created, media_kind, media_path)
+        VALUES (?,?,?,?,?,?,?,?,?,?,NULL)
+        ON CONFLICT(chat_id, msg_id) DO UPDATE SET
+            text=excluded.text, sender_name=excluded.sender_name,
+            username=excluded.username, chat_title=excluded.chat_title
+        """,
         (
             event.chat_id,
             msg.id,
@@ -213,9 +339,12 @@ async def save(event) -> None:
             username,
             message_text(msg),
             int(time.time()),
+            kind,
         ),
     )
     db.commit()
+    if kind:
+        asyncio.create_task(download_media(event, kind))
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -254,7 +383,7 @@ async def on_edit(event):
             + "\n\nNew:\n"
             + quote(clip(new_text, budget))
         )
-        await save(event)
+        await save(event, with_media=False)  # медиа уже сохранено
     except Exception:
         log.exception("on_edit")
 
@@ -266,41 +395,79 @@ async def on_delete(event):
         if not ids:
             return
         marks = ",".join("?" * len(ids))
+        cols = (
+            "chat_id, msg_id, sender_id, sender_name, username, chat_title, "
+            "text, media_kind, media_path"
+        )
         if event.chat_id is not None:
             # супергруппа: id уникальны только внутри чата
             rows = db.execute(
-                f"SELECT chat_id, msg_id, sender_id, sender_name, username, chat_title, text "
-                f"FROM messages WHERE chat_id=? AND msg_id IN ({marks})",
+                f"SELECT {cols} FROM messages WHERE chat_id=? AND msg_id IN ({marks})",
                 [event.chat_id, *ids],
             ).fetchall()
         else:
             # личка или обычная группа: Telegram не сообщает чат,
             # но id в них общие для аккаунта и не пересекаются
             rows = db.execute(
-                f"SELECT chat_id, msg_id, sender_id, sender_name, username, chat_title, text "
-                f"FROM messages WHERE is_channel=0 AND msg_id IN ({marks})",
+                f"SELECT {cols} FROM messages WHERE is_channel=0 AND msg_id IN ({marks})",
                 ids,
             ).fetchall()
-        for chat_id, msg_id, sender_id, name, username, title, text in rows:
-            if sender_id == owner_id:
-                continue
-            head = f"{who(name, username)} удалил(а) сообщение{where(title)}:\n\n"
-            await notify(head + quote(clip(text, MAX_LEN - len(head) - 40)))
+        for chat_id, msg_id, sender_id, name, username, title, text, kind, path in rows:
             db.execute(
                 "DELETE FROM messages WHERE chat_id=? AND msg_id=?", (chat_id, msg_id)
             )
-        db.commit()
+            db.commit()
+            if sender_id == owner_id:
+                remove_file(path)
+                continue
+            head = f"{who(name, username)} удалил(а) сообщение{where(title)}:\n\n"
+            if path and os.path.exists(path):
+                # сам файл уже показывает, что это — убираем метку вроде [фото]
+                body = (text or "").split("] ", 1)[1] if (text or "").startswith("[") and "] " in text else ""
+                caption = head.rstrip() if not body else head + quote(clip(body, MAX_LEN - len(head) - 40))
+                if not await notify_media(kind, path, caption):
+                    await notify(caption + "\n\n(файл не удалось отправить)")
+                remove_file(path)
+            else:
+                await notify(head + quote(clip(text, MAX_LEN - len(head) - 40)))
     except Exception:
         log.exception("on_delete")
 
 
 async def cleanup_loop():
     while True:
-        cutoff = int(time.time()) - RETENTION_DAYS * 86400
-        n = db.execute("DELETE FROM messages WHERE created < ?", (cutoff,)).rowcount
+        now = int(time.time())
+        # медиа удаляем раньше текста — оно занимает место на диске
+        old_media = db.execute(
+            "SELECT chat_id, msg_id, media_path FROM messages "
+            "WHERE media_path IS NOT NULL AND created < ?",
+            (now - MEDIA_RETENTION_DAYS * 86400,),
+        ).fetchall()
+        for chat_id, msg_id, path in old_media:
+            remove_file(path)
+            db.execute(
+                "UPDATE messages SET media_path=NULL WHERE chat_id=? AND msg_id=?",
+                (chat_id, msg_id),
+            )
+        n = db.execute(
+            "DELETE FROM messages WHERE created < ?",
+            (now - RETENTION_DAYS * 86400,),
+        ).rowcount
         db.commit()
-        if n:
-            log.info("Очистка: удалено %d старых сообщений", n)
+        # файлы, на которые в базе больше никто не ссылается
+        known = {p for (p,) in db.execute(
+            "SELECT media_path FROM messages WHERE media_path IS NOT NULL"
+        )}
+        stray = 0
+        for f in MEDIA_DIR.iterdir():
+            if str(f) not in known and now - f.stat().st_mtime > 3600:
+                remove_file(str(f))
+                stray += 1
+        if n or old_media or stray:
+            log.info(
+                "Очистка: %d сообщений, %d медиа, %d лишних файлов",
+                n, len(old_media), stray,
+            )
         await asyncio.sleep(6 * 3600)
 
 
