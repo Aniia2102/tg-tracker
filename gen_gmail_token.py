@@ -44,8 +44,21 @@ if path:
     client_id, client_secret = info["client_id"], info["client_secret"]
     print(f"Взяла ключи из файла {os.path.basename(path)}")
 else:
-    client_id = "".join(input("Client ID: ").split())
-    client_secret = "".join(input("Client Secret: ").split())
+    # вставка может прийти с переносами строк — склеиваем, пока значение не полное
+    client_id = ""
+    print("Вставь Client ID и нажми Enter:")
+    while not client_id.endswith(".apps.googleusercontent.com"):
+        line = "".join(input().split())
+        if not line and client_id:
+            break
+        client_id += line
+    client_secret = ""
+    print("Вставь Client Secret и нажми Enter:")
+    while len(client_secret) < 35:
+        line = "".join(input().split())
+        if not line and client_secret:
+            break
+        client_secret += line
 
 if not client_id.endswith(".apps.googleusercontent.com"):
     raise SystemExit(
