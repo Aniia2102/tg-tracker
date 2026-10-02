@@ -256,6 +256,9 @@ async def notify_media(kind: str, path: str, caption: str) -> bool:
     else:
         await notify(caption)
     ok = await bot_call(method, file_field=field, file_path=path, fields=fields)
+    if not ok and kind == "video_note":
+        # Telegram не принял как кружок — шлём обычным видео
+        ok = await bot_call("sendVideo", file_field="video", file_path=path, fields=fields)
     if not ok and kind != "document":
         # например, голосовое в неподходящем формате — шлём как файл
         ok = await bot_call(
@@ -299,6 +302,13 @@ async def download_media(event, kind: str) -> None:
             remove_file(path)  # сообщение уже удалили, пока качали
     except Exception:
         log.exception("download_media")
+    finally:
+        pending.pop((event.chat_id, msg.id), None)
+
+
+# загрузки, которые ещё идут: (chat_id, msg_id) -> задача
+pending: dict[tuple[int, int], asyncio.Task] = {}
+DOWNLOAD_WAIT = 60  # сколько ждать загрузку, если сообщение удалили раньше
 
 
 async def save(event, *, with_media: bool = True) -> None:
@@ -344,7 +354,7 @@ async def save(event, *, with_media: bool = True) -> None:
     )
     db.commit()
     if kind:
-        asyncio.create_task(download_media(event, kind))
+        pending[(event.chat_id, msg.id)] = asyncio.create_task(download_media(event, kind))
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -413,6 +423,18 @@ async def on_delete(event):
                 ids,
             ).fetchall()
         for chat_id, msg_id, sender_id, name, username, title, text, kind, path in rows:
+            task = pending.get((chat_id, msg_id))
+            if task and sender_id != owner_id:
+                # файл ещё качается — ждём, иначе пришлём только метку
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), DOWNLOAD_WAIT)
+                except asyncio.TimeoutError:
+                    log.warning("Загрузка %s_%s не успела за %ss", chat_id, msg_id, DOWNLOAD_WAIT)
+                row = db.execute(
+                    "SELECT media_path FROM messages WHERE chat_id=? AND msg_id=?",
+                    (chat_id, msg_id),
+                ).fetchone()
+                path = row[0] if row else path
             db.execute(
                 "DELETE FROM messages WHERE chat_id=? AND msg_id=?", (chat_id, msg_id)
             )
