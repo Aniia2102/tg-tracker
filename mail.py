@@ -620,23 +620,40 @@ async def on_callback(cb: dict) -> None:
 
 # ---------------------------------------------------------------- меню и «прочитать всё»
 
-BTN_DIGEST = "📬 Письма на разбор"
-BTN_CLEAN = "🧹 Почистить почту"
-BTN_READ = "📖 Прочитать всё"
+BTN_DIGEST = "📬 Письма"
+BTN_CLEAN = "🧹 Чистка"
+BTN_READ = "📖 Прочитать"
+BTN_AUTOREAD = "🔁 Автопрочтение"
+BTN_STATS = "📊 Статистика"
+BTN_HELP = "❓ Помощь"
 BTN_SETTINGS = "⚙️ Настройки"
 
+# старые подписи кнопок — чтобы нажатия с прежней клавиатуры тоже работали
+OLD_LABELS = {
+    "📬 Письма на разбор": BTN_DIGEST,
+    "🧹 Почистить почту": BTN_CLEAN,
+    "📖 Прочитать всё": BTN_READ,
+}
+
 MENU_KB = {
-    "keyboard": [[{"text": BTN_DIGEST}, {"text": BTN_CLEAN}], [{"text": BTN_READ}, {"text": BTN_SETTINGS}]],
+    "keyboard": [
+        [{"text": BTN_DIGEST}, {"text": BTN_CLEAN}, {"text": BTN_READ}],
+        [{"text": BTN_AUTOREAD}, {"text": BTN_STATS}, {"text": BTN_HELP}],
+        [{"text": BTN_SETTINGS}],
+    ],
     "resize_keyboard": True,
     "is_persistent": True,
     "input_field_placeholder": "Выбери действие 👇",
 }
+MENU_VERSION = "2"
 
 COMMANDS = [
     {"command": "menu", "description": "Показать меню"},
     {"command": "digest", "description": "Письма на разбор"},
     {"command": "cleanup", "description": "Почистить почту"},
     {"command": "readall", "description": "Отметить всё прочитанным"},
+    {"command": "autoread", "description": "Вкл/выкл автопрочтение"},
+    {"command": "stats", "description": "Статистика"},
     {"command": "settings", "description": "Настройки"},
 ]
 
@@ -702,15 +719,33 @@ async def show_menu() -> None:
         "sendMessage",
         chat_id=owner_id,
         text=(
-            "👋 Меню почты\n\n"
+            "👋 <b>Меню почты</b>\n\n"
             f"{BTN_DIGEST} — следующая порция писем с кнопками ⭐ / 🗑 / 📖\n"
             f"{BTN_CLEAN} — удалить промо, коды, рассылки и прочий мусор\n"
             f"{BTN_READ} — отметить все входящие прочитанными\n"
-            f"{BTN_SETTINGS} — автопрочтение и статистика\n\n"
-            f"Каждый вечер в {DIGEST_HOUR:02d}:00 сводка приходит сама."
+            f"{BTN_AUTOREAD} — включить / выключить автопрочтение\n"
+            f"{BTN_STATS} — сколько оставлено и удалено\n"
+            f"{BTN_SETTINGS} — всё вместе на одном экране\n\n"
+            f"🕖 Каждый вечер в {DIGEST_HOUR:02d}:00 сводка приходит сама."
         ),
+        parse_mode="HTML",
         reply_markup=MENU_KB,
     )
+
+
+async def toggle_auto_read() -> None:
+    on = kv_get("auto_read") != "1"
+    kv_set("auto_read", "1" if on else "0")
+    if on:
+        n = await mark_all_read(report=False)
+        text = (
+            "🔁 Автопрочтение <b>включено</b> ✅\n"
+            "Каждые 10 минут всё новое во «Входящих» будет отмечаться прочитанным."
+            + (f"\nСразу отметила {n} писем." if n else "")
+        )
+    else:
+        text = "🔁 Автопрочтение <b>выключено</b> ⏸\nНовые письма останутся непрочитанными."
+    await tg("sendMessage", chat_id=owner_id, text=text, parse_mode="HTML", reply_markup=MENU_KB)
 
 
 async def do_cleanup() -> None:
@@ -722,15 +757,20 @@ async def do_cleanup() -> None:
 
 async def on_message(m: dict) -> None:
     text = (m.get("text") or "").strip().split("@")[0]
+    text = OLD_LABELS.get(text, text)
     if text in ("/digest", BTN_DIGEST):
         await send_digest()
     elif text in ("/cleanup", BTN_CLEAN):
         await do_cleanup()
     elif text in ("/readall", BTN_READ):
         await mark_all_read()
+    elif text in ("/autoread", BTN_AUTOREAD):
+        await toggle_auto_read()
+    elif text in ("/stats", BTN_STATS):
+        await tg("sendMessage", chat_id=owner_id, text="📊 " + stats_text().replace("   ", "\n"), reply_markup=MENU_KB)
     elif text in ("/settings", BTN_SETTINGS):
         await show_settings()
-    elif text in ("/start", "/help", "/menu"):
+    elif text in ("/start", "/help", "/menu", BTN_HELP):
         await show_menu()
 
 
@@ -848,9 +888,9 @@ async def setup_menu() -> None:
     try:
         await tg("setMyCommands", commands=COMMANDS)
         await tg("setChatMenuButton", chat_id=owner_id, menu_button={"type": "commands"})
-        if kv_get("menu_shown") != "1":
+        if kv_get("menu_shown") != MENU_VERSION:
             await show_menu()
-            kv_set("menu_shown", "1")
+            kv_set("menu_shown", MENU_VERSION)
         if kv_get("initial_read") != "1":
             kv_set("initial_read", "1")
             await mark_all_read()
