@@ -378,38 +378,154 @@ def digest_keyboard(tids: list[str], start: int) -> dict:
 
 
 async def send_digest(limit: int = DIGEST_LIMIT, header: str = "") -> int:
+    """Подтянуть новые письма в очередь и показать карточку первого."""
     candidates = await list_threads(DIGEST_QUERY, limit=limit * 4 + 50)
     known = {r[0] for r in db.execute("SELECT thread_id FROM gmail_items")}
     fresh = [t for t in candidates if t not in known][:limit]
-    if not fresh:
-        await tg("sendMessage", chat_id=owner_id, text=(header + "📭 Новых писем для разбора нет.").strip())
-        return 0
+    now = int(time.time())
     for tid in fresh:
         meta = await thread_meta(tid)
         db.execute(
             "INSERT OR REPLACE INTO gmail_items VALUES (?,?,?,?,?,?)",
-            (tid, "sent", meta["subject"], meta["sender"], meta["snippet"], int(time.time())),
+            (tid, "sent", meta["subject"], meta["sender"], meta["snippet"], now),
         )
     db.commit()
-    intro = (header + f"📬 Письма на разбор: {len(fresh)}\n⭐ — оставить, 🗑 — удалить, 📖 — прочитать").strip()
-    await tg("sendMessage", chat_id=owner_id, text=intro)
-    for p in range(0, len(fresh), PAGE):
-        chunk = fresh[p : p + PAGE]
-        res = await tg(
-            "sendMessage",
-            chat_id=owner_id,
-            text=digest_text(chunk, p + 1),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=digest_keyboard(chunk, p + 1),
-        )
-        if res:
-            db.execute(
-                "INSERT INTO digest_msgs VALUES (?,?)",
-                (res["message_id"], json.dumps({"start": p + 1, "ids": chunk})),
-            )
-    db.commit()
+    if not queue():
+        await tg("sendMessage", chat_id=owner_id, text=(header + "📭 Новых писем для разбора нет.").strip())
+        return 0
+    # у прошлой карточки убираем кнопки — работаем только с новой
+    old = kv_get("card_msg")
+    if old:
+        await tg("editMessageReplyMarkup", chat_id=owner_id, message_id=int(old), reply_markup={"inline_keyboard": []})
+    await render_card(header=header)
     return len(fresh)
+
+
+# ---------------------------------------------------------------- карточка письма
+
+def queue() -> list[str]:
+    return [r[0] for r in db.execute(
+        "SELECT thread_id FROM gmail_items WHERE status='sent' ORDER BY created, rowid"
+    )]
+
+
+def _item(tid: str):
+    return db.execute("SELECT subject, sender, snippet FROM gmail_items WHERE thread_id=?", (tid,)).fetchone()
+
+
+async def render_card(msg_id: int | None = None, header: str = "", full: bool = False, confirm_all: bool = False) -> None:
+    q = queue()
+    last = kv_get("last_action")
+    undo = [{"text": "↩️ Отменить последнее", "callback_data": "c:z"}] if last else None
+
+    if not q:
+        kept, trashed, _ = (x or 0 for x in db.execute(
+            "SELECT SUM(status='kept'), SUM(status='trashed'), 0 FROM gmail_items").fetchone())
+        text = header + "✅ <b>Все письма разобраны!</b>\n\nНовые придут в сводке в " + f"{DIGEST_HOUR:02d}:00."
+        kb = [[{"text": "📬 Проверить новые", "callback_data": "c:more"}]]
+        if undo:
+            kb.insert(0, undo)
+    elif confirm_all:
+        text = f"🗑 Удалить все оставшиеся письма ({len(q)})?\nОни попадут в Корзину Gmail, их можно будет вернуть 30 дней."
+        kb = [[{"text": f"Да, удалить {len(q)}", "callback_data": "c:allyes"},
+               {"text": "Нет, назад", "callback_data": "c:back"}]]
+    else:
+        tid = q[0]
+        subject, sender, snippet = _item(tid)
+        top = f"{header}📬 <b>Письмо на разбор</b> · осталось {len(q)}\n\n<b>{html.escape(subject)}</b>\n👤 {html.escape(sender)}\n\n"
+        if full:
+            try:
+                body = await thread_text(tid)
+            except Exception as e:
+                body = f"(не удалось загрузить: {e})"
+        else:
+            body = snippet
+        room = 3900 - len(top)
+        text = top + html.escape(body[:room] + ("…" if len(body) > room else ""))
+        kb = [
+            [{"text": "⭐ Оставить", "callback_data": f"c:k:{tid}"},
+             {"text": "🗑 Удалить", "callback_data": f"c:d:{tid}"}],
+            [({"text": "⬆️ Свернуть", "callback_data": f"c:s:{tid}"} if full
+              else {"text": "📖 Читать полностью", "callback_data": f"c:f:{tid}"}),
+             {"text": "⏭ Позже", "callback_data": f"c:l:{tid}"}],
+            [{"text": "🔗 Открыть в Gmail", "url": gmail_link(tid)}],
+        ]
+        if undo:
+            kb.append(undo)
+        if len(q) > 1:
+            kb.append([{"text": f"🗑 Удалить все оставшиеся ({len(q)})", "callback_data": "c:all"}])
+
+    markup = {"inline_keyboard": kb}
+    if msg_id:
+        await tg("editMessageText", chat_id=owner_id, message_id=msg_id, text=text,
+                 parse_mode="HTML", disable_web_page_preview=True, reply_markup=markup)
+    else:
+        res = await tg("sendMessage", chat_id=owner_id, text=text,
+                       parse_mode="HTML", disable_web_page_preview=True, reply_markup=markup)
+        if res:
+            kv_set("card_msg", res["message_id"])
+
+
+async def on_card_callback(cb: dict, data: str, msg_id: int) -> None:
+    parts = data.split(":", 2)
+    act = parts[1]
+    tid = parts[2] if len(parts) > 2 else ""
+
+    if act == "k":
+        await gmail("POST", f"/threads/{tid}/modify", json={"addLabelIds": ["STARRED"]})
+        set_status(tid, "kept")
+        kv_set("last_action", json.dumps({"t": tid, "a": "k"}))
+        await answer(cb["id"], "⭐ Оставлено")
+    elif act == "d":
+        await gmail("POST", f"/threads/{tid}/trash")
+        set_status(tid, "trashed")
+        kv_set("last_action", json.dumps({"t": tid, "a": "d"}))
+        await answer(cb["id"], "🗑 В корзине")
+    elif act == "l":
+        # в конец очереди
+        db.execute("UPDATE gmail_items SET created=? WHERE thread_id=?", (int(time.time()) + 1, tid))
+        db.commit()
+        await answer(cb["id"], "⏭ Вернусь к нему позже")
+    elif act == "f":
+        await answer(cb["id"])
+        await render_card(msg_id, full=True)
+        return
+    elif act in ("s", "back"):
+        await answer(cb["id"])
+    elif act == "z":
+        last = kv_get("last_action")
+        if last:
+            info = json.loads(last)
+            if info["a"] == "k":
+                await gmail("POST", f"/threads/{info['t']}/modify", json={"removeLabelIds": ["STARRED"]})
+            else:
+                await gmail("POST", f"/threads/{info['t']}/untrash")
+            first = db.execute("SELECT MIN(created) FROM gmail_items").fetchone()[0] or 0
+            db.execute("UPDATE gmail_items SET status='sent', created=? WHERE thread_id=?", (first - 1, info["t"]))
+            db.execute("DELETE FROM kv WHERE k='last_action'")
+            db.commit()
+        await answer(cb["id"], "↩️ Отменено")
+    elif act == "all":
+        await answer(cb["id"])
+        await render_card(msg_id, confirm_all=True)
+        return
+    elif act == "allyes":
+        q = queue()
+        await answer(cb["id"], f"Удаляю {len(q)}…")
+        await trash_many(q)
+        for t in q:
+            set_status(t, "trashed")
+        db.execute("DELETE FROM kv WHERE k='last_action'")
+        db.commit()
+    elif act == "more":
+        await answer(cb["id"], "Проверяю почту…")
+        await tg("editMessageReplyMarkup", chat_id=owner_id, message_id=msg_id, reply_markup={"inline_keyboard": []})
+        await send_digest()
+        return
+    else:
+        await answer(cb["id"])
+        return
+    await render_card(msg_id)
 
 
 # ---------------------------------------------------------------- чистка
@@ -536,6 +652,9 @@ async def on_callback(cb: dict) -> None:
         return
     if not ENABLED:
         await answer(cb["id"], "Почта не подключена")
+        return
+    if data.startswith("c:"):
+        await on_card_callback(cb, data, msg_id)
         return
 
     if data == "ar":
