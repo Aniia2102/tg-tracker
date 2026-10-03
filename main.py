@@ -17,6 +17,7 @@ tg-tracker — юзербот, который присылает через от
 
 import asyncio
 import html
+import json
 import logging
 import os
 import sqlite3
@@ -234,22 +235,30 @@ async def bot_call(method: str, *, json=None, file_field=None, file_path=None, f
     return False
 
 
-async def notify(text: str) -> None:
-    await bot_call(
-        "sendMessage",
-        json={
-            "chat_id": owner_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-    )
+def mute_kb(chat_id: int | None) -> dict | None:
+    if chat_id is None:
+        return None
+    return {"inline_keyboard": [[{"text": "🔕 Не следить за этим чатом", "callback_data": f"mute:{chat_id}"}]]}
 
 
-async def notify_media(kind: str, path: str, caption: str) -> bool:
+async def notify(text: str, chat_id: int | None = None) -> None:
+    payload = {
+        "chat_id": owner_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if (kb := mute_kb(chat_id)):
+        payload["reply_markup"] = kb
+    await bot_call("sendMessage", json=payload)
+
+
+async def notify_media(kind: str, path: str, caption: str, chat_id: int | None = None) -> bool:
     """Отправить сохранённый файл. Подпись — если влезает в лимит."""
     method, field = SEND_METHOD.get(kind, SEND_METHOD["document"])
     fields = {"chat_id": owner_id}
+    if (kb := mute_kb(chat_id)):
+        fields["reply_markup"] = json.dumps(kb)
     long_caption = len(caption) > MAX_CAPTION
     # у кружков подписи не бывает
     if kind != "video_note" and not long_caption:
@@ -277,6 +286,8 @@ bot_id = int(BOT_TOKEN.split(":")[0])
 async def should_track(event) -> bool:
     """Личка с человеком (не бот) или группа. Свои сообщения — нет."""
     if event.out or event.sender_id == owner_id:
+        return False
+    if mail.is_muted(event.chat_id):
         return False
     if event.is_private:
         if event.chat_id == bot_id:
@@ -392,7 +403,8 @@ async def on_edit(event):
             + "Old:\n"
             + quote(clip(old_text, budget))
             + "\n\nNew:\n"
-            + quote(clip(new_text, budget))
+            + quote(clip(new_text, budget)),
+            chat_id=event.chat_id,
         )
         await save(event, with_media=False)  # медиа уже сохранено
     except Exception:
@@ -440,7 +452,7 @@ async def on_delete(event):
                 "DELETE FROM messages WHERE chat_id=? AND msg_id=?", (chat_id, msg_id)
             )
             db.commit()
-            if sender_id == owner_id:
+            if sender_id == owner_id or mail.is_muted(chat_id):
                 remove_file(path)
                 continue
             head = f"{who(name, username)} удалил(а) сообщение{where(title)}:\n\n"
@@ -448,11 +460,11 @@ async def on_delete(event):
                 # сам файл уже показывает, что это — убираем метку вроде [фото]
                 body = (text or "").split("] ", 1)[1] if (text or "").startswith("[") and "] " in text else ""
                 caption = head.rstrip() if not body else head + quote(clip(body, MAX_LEN - len(head) - 40))
-                if not await notify_media(kind, path, caption):
-                    await notify(caption + "\n\n(файл не удалось отправить)")
+                if not await notify_media(kind, path, caption, chat_id=chat_id):
+                    await notify(caption + "\n\n(файл не удалось отправить)", chat_id=chat_id)
                 remove_file(path)
             else:
-                await notify(head + quote(clip(text, MAX_LEN - len(head) - 40)))
+                await notify(head + quote(clip(text, MAX_LEN - len(head) - 40)), chat_id=chat_id)
     except Exception:
         log.exception("on_delete")
 
@@ -509,9 +521,8 @@ async def main():
     owner_id = me.id
     log.info("Запущен как %s (id %s), база %s", display_name(me), me.id, DB_PATH)
     asyncio.create_task(cleanup_loop())
-    if mail.ENABLED:
-        mail.start(http, db, owner_id, BOT_TOKEN)
-    else:
+    mail.start(http, db, owner_id, BOT_TOKEN, remove_file=remove_file)
+    if not mail.ENABLED:
         log.info("Почта выключена: нет GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN")
     try:
         await client.run_until_disconnected()

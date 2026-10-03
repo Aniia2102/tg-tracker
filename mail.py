@@ -119,9 +119,16 @@ def init_db() -> None:
             thread_ids TEXT NOT NULL       -- JSON-список в порядке номеров
         );
         CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS muted_chats (
+            chat_id INTEGER PRIMARY KEY,
+            title   TEXT,
+            created INTEGER NOT NULL
+        );
         """
     )
     db.commit()
+    _muted.clear()
+    _muted.update(r[0] for r in db.execute("SELECT chat_id FROM muted_chats"))
 
 
 def kv_get(k: str, default=None):
@@ -525,6 +532,12 @@ async def on_callback(cb: dict) -> None:
     msg = cb.get("message") or {}
     chat_id, msg_id = msg.get("chat", {}).get("id"), msg.get("message_id")
 
+    if await on_chat_callback(cb, data, msg_id):
+        return
+    if not ENABLED:
+        await answer(cb["id"], "Почта не подключена")
+        return
+
     if data == "ar":
         on = kv_get("auto_read") != "1"
         kv_set("auto_read", "1" if on else "0")
@@ -626,6 +639,7 @@ BTN_READ = "📖 Прочитать"
 BTN_AUTOREAD = "🔁 Автопрочтение"
 BTN_STATS = "📊 Статистика"
 BTN_HELP = "❓ Помощь"
+BTN_CHATS = "🔕 Чаты"
 BTN_SETTINGS = "⚙️ Настройки"
 
 # старые подписи кнопок — чтобы нажатия с прежней клавиатуры тоже работали
@@ -638,14 +652,14 @@ OLD_LABELS = {
 MENU_KB = {
     "keyboard": [
         [{"text": BTN_DIGEST}, {"text": BTN_CLEAN}, {"text": BTN_READ}],
-        [{"text": BTN_AUTOREAD}, {"text": BTN_STATS}, {"text": BTN_HELP}],
+        [{"text": BTN_AUTOREAD}, {"text": BTN_STATS}, {"text": BTN_CHATS}],
         [{"text": BTN_SETTINGS}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
     "input_field_placeholder": "Выбери действие 👇",
 }
-MENU_VERSION = "2"
+MENU_VERSION = "3"
 
 COMMANDS = [
     {"command": "menu", "description": "Показать меню"},
@@ -654,7 +668,9 @@ COMMANDS = [
     {"command": "readall", "description": "Отметить всё прочитанным"},
     {"command": "autoread", "description": "Вкл/выкл автопрочтение"},
     {"command": "stats", "description": "Статистика"},
+    {"command": "chats", "description": "Отключённые чаты"},
     {"command": "settings", "description": "Настройки"},
+    {"command": "help", "description": "Помощь"},
 ]
 
 AUTO_READ_EVERY = 10 * 60  # секунд
@@ -714,6 +730,123 @@ async def show_settings(edit_msg_id: int | None = None) -> None:
         await tg("sendMessage", chat_id=owner_id, text=text, parse_mode="HTML", reply_markup=kb)
 
 
+# ---------------------------------------------------------------- отключённые чаты
+
+_muted: set[int] = set()
+_remove_file = lambda path: None  # main.py подставляет свою функцию
+
+
+def is_muted(chat_id) -> bool:
+    return chat_id in _muted
+
+
+def chat_title(chat_id: int) -> str:
+    row = db.execute(
+        "SELECT MAX(chat_title), MAX(sender_name) FROM messages WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    if row and (row[0] or row[1]):
+        return row[0] or row[1]
+    row = db.execute("SELECT title FROM muted_chats WHERE chat_id=?", (chat_id,)).fetchone()
+    return (row[0] if row and row[0] else None) or f"чат {chat_id}"
+
+
+def mute(chat_id: int) -> str:
+    title = chat_title(chat_id)
+    db.execute("INSERT OR REPLACE INTO muted_chats VALUES (?,?,?)", (chat_id, title, int(time.time())))
+    # сохранённые сообщения этого чата больше не нужны
+    for (path,) in db.execute(
+        "SELECT media_path FROM messages WHERE chat_id=? AND media_path IS NOT NULL", (chat_id,)
+    ).fetchall():
+        _remove_file(path)
+    db.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
+    db.commit()
+    _muted.add(chat_id)
+    return title
+
+
+def unmute(chat_id: int) -> str:
+    title = chat_title(chat_id)
+    db.execute("DELETE FROM muted_chats WHERE chat_id=?", (chat_id,))
+    db.commit()
+    _muted.discard(chat_id)
+    return title
+
+
+def chats_view() -> tuple[str, dict]:
+    rows = db.execute("SELECT chat_id, title FROM muted_chats ORDER BY created DESC").fetchall()
+    if rows:
+        text = (
+            "🔕 <b>Отключённые чаты</b>\n"
+            "Из них не присылаю удалённые и изменённые сообщения.\n\n"
+            + "\n".join(f"• {html.escape(t or str(c))}" for c, t in rows)
+        )
+    else:
+        text = (
+            "🔕 <b>Отключённых чатов нет</b>\n\n"
+            "Отключить чат можно кнопкой «🔕 Не следить за этим чатом» под любым уведомлением "
+            "или здесь — «➕ Отключить чат»."
+        )
+    kb = [[{"text": f"🔔 {(t or str(c))[:40]}", "callback_data": f"unmute:{c}:v"}] for c, t in rows]
+    kb.append([{"text": "➕ Отключить чат", "callback_data": "pick"}])
+    return text, {"inline_keyboard": kb}
+
+
+async def show_chats(edit_msg_id: int | None = None) -> None:
+    text, kb = chats_view()
+    if edit_msg_id:
+        await tg("editMessageText", chat_id=owner_id, message_id=edit_msg_id, text=text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await tg("sendMessage", chat_id=owner_id, text=text, parse_mode="HTML", reply_markup=kb)
+
+
+async def show_pick(msg_id: int) -> None:
+    """Недавние чаты, из которых приходили сообщения, — выбрать, какой отключить."""
+    rows = db.execute(
+        "SELECT chat_id, COALESCE(MAX(chat_title), MAX(sender_name)), MAX(created) AS last "
+        "FROM messages GROUP BY chat_id ORDER BY last DESC LIMIT 20"
+    ).fetchall()
+    rows = [(c, t) for c, t, _ in rows if c not in _muted][:12]
+    if not rows:
+        text = "Пока не из чего выбрать — бот ещё не видел сообщений из других чатов."
+    else:
+        text = "Какой чат отключить? Недавние:"
+    kb = [[{"text": (t or str(c))[:45], "callback_data": f"mute:{c}:v"}] for c, t in rows]
+    kb.append([{"text": "← Назад", "callback_data": "chats"}])
+    await tg("editMessageText", chat_id=owner_id, message_id=msg_id, text=text, reply_markup={"inline_keyboard": kb})
+
+
+async def on_chat_callback(cb: dict, data: str, msg_id: int) -> bool:
+    """Кнопки отключения чатов. True — если нажатие обработано."""
+    if data == "pick":
+        await answer(cb["id"])
+        await show_pick(msg_id)
+        return True
+    if data == "chats":
+        await answer(cb["id"])
+        await show_chats(edit_msg_id=msg_id)
+        return True
+    kind, _, rest = data.partition(":")
+    if kind not in ("mute", "unmute"):
+        return False
+    chat_s, _, from_view = rest.partition(":")
+    chat_id = int(chat_s)
+    if kind == "mute":
+        title = mute(chat_id)
+        await answer(cb["id"], f"🔕 Больше не слежу за «{title[:40]}»")
+        flip = {"text": "🔔 Снова следить за этим чатом", "callback_data": f"unmute:{chat_id}"}
+    else:
+        title = unmute(chat_id)
+        await answer(cb["id"], f"🔔 Снова слежу за «{title[:40]}»")
+        flip = {"text": "🔕 Не следить за этим чатом", "callback_data": f"mute:{chat_id}"}
+    if from_view:
+        await show_chats(edit_msg_id=msg_id)
+    else:
+        # нажали под уведомлением — меняем кнопку на противоположную
+        await tg("editMessageReplyMarkup", chat_id=owner_id, message_id=msg_id,
+                 reply_markup={"inline_keyboard": [[flip]]})
+    return True
+
+
 async def show_menu() -> None:
     await tg(
         "sendMessage",
@@ -725,6 +858,7 @@ async def show_menu() -> None:
             f"{BTN_READ} — отметить все входящие прочитанными\n"
             f"{BTN_AUTOREAD} — включить / выключить автопрочтение\n"
             f"{BTN_STATS} — сколько оставлено и удалено\n"
+            f"{BTN_CHATS} — чаты, из которых не присылать удалённые и изменённые\n"
             f"{BTN_SETTINGS} — всё вместе на одном экране\n\n"
             f"🕖 Каждый вечер в {DIGEST_HOUR:02d}:00 сводка приходит сама."
         ),
@@ -758,6 +892,15 @@ async def do_cleanup() -> None:
 async def on_message(m: dict) -> None:
     text = (m.get("text") or "").strip().split("@")[0]
     text = OLD_LABELS.get(text, text)
+    if text in ("/chats", BTN_CHATS):
+        await show_chats()
+        return
+    if text in ("/start", "/help", "/menu", BTN_HELP):
+        await show_menu()
+        return
+    if not ENABLED:
+        await tg("sendMessage", chat_id=owner_id, text="📭 Почта не подключена (нет переменных GMAIL_… на Railway).")
+        return
     if text in ("/digest", BTN_DIGEST):
         await send_digest()
     elif text in ("/cleanup", BTN_CLEAN):
@@ -768,6 +911,8 @@ async def on_message(m: dict) -> None:
         await toggle_auto_read()
     elif text in ("/stats", BTN_STATS):
         await tg("sendMessage", chat_id=owner_id, text="📊 " + stats_text().replace("   ", "\n"), reply_markup=MENU_KB)
+    elif text in ("/chats", BTN_CHATS):
+        await show_chats()
     elif text in ("/settings", BTN_SETTINGS):
         await show_settings()
     elif text in ("/start", "/help", "/menu", BTN_HELP):
@@ -870,17 +1015,18 @@ async def scheduler_loop() -> None:
         await asyncio.sleep(60)
 
 
-def start(session: aiohttp.ClientSession, database: sqlite3.Connection, owner: int, token: str) -> list[asyncio.Task]:
-    global http, db, owner_id, bot_token
+def start(session: aiohttp.ClientSession, database: sqlite3.Connection, owner: int, token: str,
+          remove_file=None) -> list[asyncio.Task]:
+    global http, db, owner_id, bot_token, _remove_file
     http, db, owner_id, bot_token = session, database, owner, token
+    if remove_file:
+        _remove_file = remove_file
     init_db()
-    log.info("Почта включена: сводка в %02d:00 (%s)", DIGEST_HOUR, TZ.key)
-    return [
-        asyncio.create_task(updates_loop()),
-        asyncio.create_task(scheduler_loop()),
-        asyncio.create_task(auto_read_loop()),
-        asyncio.create_task(setup_menu()),
-    ]
+    tasks = [asyncio.create_task(updates_loop()), asyncio.create_task(setup_menu())]
+    if ENABLED:
+        log.info("Почта включена: сводка в %02d:00 (%s)", DIGEST_HOUR, TZ.key)
+        tasks += [asyncio.create_task(scheduler_loop()), asyncio.create_task(auto_read_loop())]
+    return tasks
 
 
 async def setup_menu() -> None:
@@ -891,7 +1037,7 @@ async def setup_menu() -> None:
         if kv_get("menu_shown") != MENU_VERSION:
             await show_menu()
             kv_set("menu_shown", MENU_VERSION)
-        if kv_get("initial_read") != "1":
+        if ENABLED and kv_get("initial_read") != "1":
             kv_set("initial_read", "1")
             await mark_all_read()
     except Exception:
