@@ -119,6 +119,12 @@ def init_db() -> None:
             thread_ids TEXT NOT NULL       -- JSON-список в порядке номеров
         );
         CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS custom_rules (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind    TEXT NOT NULL,      -- from / subject
+            value   TEXT NOT NULL,
+            created INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS muted_chats (
             chat_id INTEGER PRIMARY KEY,
             title   TEXT,
@@ -126,6 +132,10 @@ def init_db() -> None:
         );
         """
     )
+    try:
+        db.execute("ALTER TABLE gmail_items ADD COLUMN email TEXT")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
     db.commit()
     _muted.clear()
     _muted.update(r[0] for r in db.execute("SELECT chat_id FROM muted_chats"))
@@ -283,8 +293,14 @@ async def thread_meta(tid: str) -> dict:
     return {
         "subject": _header(first, "Subject") or "(без темы)",
         "sender": _clean_sender(_header(last, "From")),
+        "email": _sender_email(_header(last, "From")),
         "snippet": html.unescape(last.get("snippet", "")),
     }
+
+
+def _sender_email(raw: str) -> str:
+    m = re.search(r"<([^>]+)>", raw)
+    return (m.group(1) if m else raw).strip().lower()
 
 
 def _decode(data: str) -> str:
@@ -386,8 +402,9 @@ async def send_digest(limit: int = DIGEST_LIMIT, header: str = "") -> int:
     for tid in fresh:
         meta = await thread_meta(tid)
         db.execute(
-            "INSERT OR REPLACE INTO gmail_items VALUES (?,?,?,?,?,?)",
-            (tid, "sent", meta["subject"], meta["sender"], meta["snippet"], now),
+            "INSERT OR REPLACE INTO gmail_items (thread_id, status, subject, sender, snippet, created, email) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (tid, "sent", meta["subject"], meta["sender"], meta["snippet"], now, meta.get("email", "")),
         )
     db.commit()
     if not queue():
@@ -449,6 +466,7 @@ async def render_card(msg_id: int | None = None, header: str = "", full: bool = 
               else {"text": "📖 Читать полностью", "callback_data": f"c:f:{tid}"}),
              {"text": "⏭ Позже", "callback_data": f"c:l:{tid}"}],
             [{"text": "🔗 Открыть в Gmail", "url": gmail_link(tid)}],
+            [{"text": f"🚫 Всегда удалять от «{(sender or '?')[:25]}»", "callback_data": f"c:b:{tid}"}],
         ]
         if undo:
             kb.append(undo)
@@ -481,6 +499,22 @@ async def on_card_callback(cb: dict, data: str, msg_id: int) -> None:
         set_status(tid, "trashed")
         kv_set("last_action", json.dumps({"t": tid, "a": "d"}))
         await answer(cb["id"], "🗑 В корзине")
+    elif act == "b":
+        row = db.execute("SELECT email, sender FROM gmail_items WHERE thread_id=?", (tid,)).fetchone()
+        email = (row[0] if row else "") or ""
+        if not email or "@" not in email:
+            await answer(cb["id"], "Не вижу адрес отправителя — добавь правило в 📋 Правила", show_alert=True)
+            return
+        add_rule("from", email)
+        same = [t for (t,) in db.execute(
+            "SELECT thread_id FROM gmail_items WHERE status='sent' AND email=?", (email,))]
+        await trash_many(same)
+        for t in same:
+            set_status(t, "trashed")
+        db.execute("DELETE FROM kv WHERE k='last_action'")
+        db.commit()
+        await answer(cb["id"], f"🚫 Теперь всё от {email} удаляется автоматически" +
+                     (f" (убрала ещё {len(same) - 1} из очереди)" if len(same) > 1 else ""), show_alert=True)
     elif act == "l":
         # в конец очереди
         db.execute("UPDATE gmail_items SET created=? WHERE thread_id=?", (int(time.time()) + 1, tid))
@@ -534,7 +568,7 @@ async def find_junk() -> tuple[dict[str, int], list[str]]:
     """Письма (не цепочки) под удаление — по правилам, без повторов."""
     counts, all_ids = {}, []
     seen = set()
-    for name, q in RULES:
+    for name, q in active_rules():
         ids = [m for m in await list_messages(rule_query(q)) if m not in seen]
         seen.update(ids)
         counts[name] = len(ids)
@@ -618,8 +652,8 @@ async def evening() -> None:
 
 # ---------------------------------------------------------------- кнопки и команды
 
-async def answer(cb_id: str, text: str = "") -> None:
-    await tg("answerCallbackQuery", callback_query_id=cb_id, text=text)
+async def answer(cb_id: str, text: str = "", show_alert: bool = False) -> None:
+    await tg("answerCallbackQuery", callback_query_id=cb_id, text=text, show_alert=show_alert)
 
 
 async def refresh_digest_message(chat_id: int, msg_id: int) -> None:
@@ -655,6 +689,9 @@ async def on_callback(cb: dict) -> None:
         return
     if data.startswith("c:"):
         await on_card_callback(cb, data, msg_id)
+        return
+    if data.startswith("r:"):
+        await on_rules_callback(cb, data, msg_id)
         return
 
     if data == "ar":
@@ -760,6 +797,7 @@ BTN_STATS = "📊 Статистика"
 BTN_HELP = "❓ Помощь"
 BTN_CHATS = "🔕 Чаты"
 BTN_SETTINGS = "⚙️ Настройки"
+BTN_RULES = "📋 Правила"
 
 # старые подписи кнопок — чтобы нажатия с прежней клавиатуры тоже работали
 OLD_LABELS = {
@@ -772,13 +810,14 @@ MENU_KB = {
     "keyboard": [
         [{"text": BTN_DIGEST}, {"text": BTN_CLEAN}, {"text": BTN_READ}],
         [{"text": BTN_AUTOREAD}, {"text": BTN_STATS}, {"text": BTN_CHATS}],
-        [{"text": BTN_SETTINGS}],
+        [{"text": BTN_SETTINGS}, {"text": BTN_RULES}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
     "input_field_placeholder": "Выбери действие 👇",
 }
-MENU_VERSION = "3"
+MENU_VERSION = "4"
+ALL_BUTTONS = {b["text"] for row in MENU_KB["keyboard"] for b in row} | set(OLD_LABELS) | {BTN_HELP}
 
 COMMANDS = [
     {"command": "menu", "description": "Показать меню"},
@@ -788,6 +827,7 @@ COMMANDS = [
     {"command": "autoread", "description": "Вкл/выкл автопрочтение"},
     {"command": "stats", "description": "Статистика"},
     {"command": "chats", "description": "Отключённые чаты"},
+    {"command": "rules", "description": "Что удаляется автоматически"},
     {"command": "settings", "description": "Настройки"},
     {"command": "help", "description": "Помощь"},
 ]
@@ -836,6 +876,7 @@ def settings_view() -> tuple[str, dict]:
         "inline_keyboard": [
             [{"text": ("⏸ Выключить автопрочтение" if auto_read else "✅ Включить автопрочтение"), "callback_data": "ar"}],
             [{"text": "📬 Прислать письма сейчас", "callback_data": "dig"}, {"text": "🧹 Почистить", "callback_data": "cl"}],
+            [{"text": "📋 Правила удаления", "callback_data": "r:view"}],
         ]
     }
     return text, kb
@@ -847,6 +888,141 @@ async def show_settings(edit_msg_id: int | None = None) -> None:
         await tg("editMessageText", chat_id=owner_id, message_id=edit_msg_id, text=text, parse_mode="HTML", reply_markup=kb)
     else:
         await tg("sendMessage", chat_id=owner_id, text=text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------------------------------------------------------- правила удаления
+
+def disabled_rules() -> set[str]:
+    return set(json.loads(kv_get("disabled_rules", "[]")))
+
+
+def custom_rules() -> list[tuple[int, str, str]]:
+    return db.execute("SELECT id, kind, value FROM custom_rules ORDER BY id").fetchall()
+
+
+def _rule_label(kind: str, value: str) -> str:
+    return f"от: {value}" if kind == "from" else f"тема: «{value}»"
+
+
+def _rule_query(kind: str, value: str) -> str:
+    if kind == "from":
+        return f"from:({value})"
+    return f'subject:("{value}")'
+
+
+def active_rules() -> list[tuple[str, str]]:
+    off = disabled_rules()
+    rules = [(name, q) for name, q in RULES if name not in off]
+    rules += [(_rule_label(k, v), _rule_query(k, v)) for _, k, v in custom_rules()]
+    return rules
+
+
+def add_rule(kind: str, value: str) -> bool:
+    if db.execute("SELECT 1 FROM custom_rules WHERE kind=? AND value=?", (kind, value)).fetchone():
+        return False
+    db.execute("INSERT INTO custom_rules (kind, value, created) VALUES (?,?,?)", (kind, value, int(time.time())))
+    db.commit()
+    return True
+
+
+def clean_rule_value(kind: str, text: str) -> str | None:
+    text = text.strip().strip('"«»\'').strip()
+    if kind == "from":
+        text = text.lower().removeprefix("@")
+        m = re.search(r"<([^>]+)>", text)
+        if m:
+            text = m.group(1)
+        if " " in text or not re.fullmatch(r"[\w.+\-@]+\.[a-zа-я]{2,}", text):
+            return None
+        return text
+    text = re.sub(r'[()"{}]', "", text)
+    return text[:60] if len(text) >= 2 else None
+
+
+def rules_view() -> tuple[str, dict]:
+    off = disabled_rules()
+    lines = ["📋 <b>Что удаляется автоматически</b>", "Каждый вечер в " + f"{DIGEST_HOUR:02d}:00 и по кнопке 🧹 Чистка.", ""]
+    lines += [f"{'✅' if name not in off else '⏸'} {html.escape(name)}" for name, _ in RULES]
+    custom = custom_rules()
+    lines.append("")
+    if custom:
+        lines.append("<b>Свои правила:</b>")
+        lines += [f"✅ {html.escape(_rule_label(k, v))}" for _, k, v in custom]
+    else:
+        lines.append("Своих правил пока нет.")
+    lines += ["", "🛡 Никогда не удаляются: ממריאות, письма со ⭐, вузы и College Board, счета, чеки, билеты и брони."]
+    kb = [[{"text": f"{'✅' if name not in off else '⏸'} {name[:38]}", "callback_data": f"r:t:{i}"}]
+          for i, (name, _) in enumerate(RULES)]
+    kb += [[{"text": f"❌ {_rule_label(k, v)[:38]}", "callback_data": f"r:d:{rid}"}] for rid, k, v in custom]
+    kb.append([{"text": "➕ Отправитель", "callback_data": "r:a:from"},
+               {"text": "➕ Слово в теме", "callback_data": "r:a:subject"}])
+    kb.append([{"text": "🧹 Почистить сейчас", "callback_data": "cl"}])
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+async def show_rules(edit_msg_id: int | None = None) -> None:
+    text, kb = rules_view()
+    if edit_msg_id:
+        await tg("editMessageText", chat_id=owner_id, message_id=edit_msg_id, text=text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await tg("sendMessage", chat_id=owner_id, text=text, parse_mode="HTML", reply_markup=kb)
+
+
+async def on_rules_callback(cb: dict, data: str, msg_id: int) -> None:
+    parts = data.split(":", 2)
+    act = parts[1]
+    arg = parts[2] if len(parts) > 2 else ""
+    if act == "view":
+        await answer(cb["id"])
+        await show_rules()
+        return
+    if act == "t":
+        name = RULES[int(arg)][0]
+        off = disabled_rules()
+        off ^= {name}
+        kv_set("disabled_rules", json.dumps(sorted(off), ensure_ascii=False))
+        await answer(cb["id"], ("⏸ Выключено: " if name in off else "✅ Включено: ") + name)
+    elif act == "d":
+        row = db.execute("SELECT kind, value FROM custom_rules WHERE id=?", (int(arg),)).fetchone()
+        db.execute("DELETE FROM custom_rules WHERE id=?", (int(arg),))
+        db.commit()
+        await answer(cb["id"], "Удалено правило " + (_rule_label(*row) if row else ""))
+    elif act == "a":
+        kv_set("awaiting", arg)
+        await answer(cb["id"])
+        prompt = (
+            "✍️ Пришли адрес или домен отправителя.\nНапример: <code>news@shop.com</code> или <code>shop.com</code>"
+            if arg == "from" else
+            "✍️ Пришли слово или фразу из темы письма.\nНапример: <code>скидка</code> или <code>webinar</code>"
+        )
+        await tg("sendMessage", chat_id=owner_id, text=prompt + "\n\nЧтобы отменить — нажми любую кнопку меню.",
+                 parse_mode="HTML")
+        return
+    else:
+        await answer(cb["id"])
+        return
+    await show_rules(edit_msg_id=msg_id)
+
+
+async def receive_rule_input(kind: str, text: str) -> None:
+    value = clean_rule_value(kind, text)
+    if not value:
+        hint = "адрес вроде news@shop.com или домен shop.com" if kind == "from" else "хотя бы 2 буквы"
+        await tg("sendMessage", chat_id=owner_id, text=f"🤔 Не похоже на правило — нужен {hint}. Попробуй ещё раз.")
+        return
+    db.execute("DELETE FROM kv WHERE k='awaiting'")
+    db.commit()
+    added = add_rule(kind, value)
+    try:
+        found = len(await list_messages(rule_query(_rule_query(kind, value))))
+    except Exception:
+        found = None
+    msg = (f"✅ Добавила правило: {_rule_label(kind, value)}" if added
+           else f"Такое правило уже есть: {_rule_label(kind, value)}")
+    if found is not None:
+        msg += f"\nСейчас под него попадает писем: {found}. Удалятся при следующей чистке."
+    await tg("sendMessage", chat_id=owner_id, text=msg, reply_markup=MENU_KB)
+    await show_rules()
 
 
 # ---------------------------------------------------------------- отключённые чаты
@@ -978,6 +1154,7 @@ async def show_menu() -> None:
             f"{BTN_AUTOREAD} — включить / выключить автопрочтение\n"
             f"{BTN_STATS} — сколько оставлено и удалено\n"
             f"{BTN_CHATS} — чаты, из которых не присылать удалённые и изменённые\n"
+            f"{BTN_RULES} — что удаляется автоматически: включить, выключить, добавить своё\n"
             f"{BTN_SETTINGS} — всё вместе на одном экране\n\n"
             f"🕖 Каждый вечер в {DIGEST_HOUR:02d}:00 сводка приходит сама."
         ),
@@ -1020,7 +1197,16 @@ async def on_message(m: dict) -> None:
     if not ENABLED:
         await tg("sendMessage", chat_id=owner_id, text="📭 Почта не подключена (нет переменных GMAIL_… на Railway).")
         return
-    if text in ("/digest", BTN_DIGEST):
+    awaiting = kv_get("awaiting")
+    if awaiting and text and not text.startswith("/") and text not in ALL_BUTTONS:
+        await receive_rule_input(awaiting, text)
+        return
+    if awaiting:
+        db.execute("DELETE FROM kv WHERE k='awaiting'")
+        db.commit()
+    if text in ("/rules", BTN_RULES):
+        await show_rules()
+    elif text in ("/digest", BTN_DIGEST):
         await send_digest()
     elif text in ("/cleanup", BTN_CLEAN):
         await do_cleanup()
