@@ -44,6 +44,8 @@ async def run():
     await cb("r:d:1"); print("after delete rule:", mail.custom_rules())
 asyncio.run(run())
 q_sender=mail.rule_query("from:(x.com)", sender=True); q_broad=mail.rule_query("category:promotions")
-assert "category:purchases" not in q_sender and "cyber.org.il" in q_sender and "is:starred" in q_sender
-assert "category:purchases" in q_broad
+assert "category:purchases" not in q_sender and "category:purchases" not in q_broad
+for q in (q_sender, q_broad):
+    assert "-invoice" in q and "-filename:invoice" in q and "cyber.org.il" in q and "is:starred" in q
+assert "from:edu" in q_broad and "from:edu" not in q_sender
 print("protection levels ok")

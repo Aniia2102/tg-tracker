@@ -57,17 +57,19 @@ KEEP = ["from:cyber.org.il", "ממריאות"] + [
 ASK = [
     "from:edu",
     "from:collegeboard.org",
-    "category:purchases",
     "from:(moovit-pango.co.il OR ravkavonline.co.il)",
     'subject:(invoice OR receipt OR "order confirmation" OR booking OR reservation OR ticket '
     "OR boarding OR itinerary OR חשבון OR חשבונית OR קבלה OR כרטיס OR הזמנה OR счёт OR счет OR билет)",
 ]
 
 SCOPE = "{in:inbox in:spam} -is:starred -in:sent"
-NEVER_DELETE = " ".join(f"-{k}" for k in KEEP + ASK)
+# счета и чеки: письмо со словом «invoice» (и аналогами) или вложением-счётом не удаляется
+# никаким правилом. Остальное из «Покупок» удалять можно — так решила Anna.
+INVOICE_GUARD = ["invoice", "חשבונית", "קבלה", "receipt", "счёт", "счет", "filename:invoice"]
+NEVER_DELETE = " ".join(f"-{k}" for k in KEEP + ASK + INVOICE_GUARD)
 # для правил «по отправителю» защита только самая важная: Gmail кладёт рассылки магазинов
 # и банков в «Покупки», и полная защита не давала их удалять вообще
-NEVER_DELETE_SENDER = " ".join(f"-{k}" for k in KEEP)
+NEVER_DELETE_SENDER = " ".join(f"-{k}" for k in KEEP + INVOICE_GUARD)
 
 # (название для отчёта, запрос Gmail)
 RULES = [
@@ -1002,7 +1004,8 @@ def rules_view() -> tuple[str, dict]:
         lines += [f"✅ {html.escape(_rule_label(k, v))}" for _, k, v in custom]
     else:
         lines.append("Своих правил пока нет.")
-    lines += ["", "🛡 Никогда не удаляются: ממריאות, письма со ⭐, вузы и College Board, счета, чеки, билеты и брони."]
+    lines += ["", "🛡 Никогда не удаляются: ממריאות, письма со ⭐, письма со словом invoice / חשבונית / קבלה / receipt или "
+              "вложением-счётом, а общими правилами — ещё вузы, College Board и билеты."]
     kb = [[{"text": f"{'✅' if name not in off else '⏸'} {name[:38]}", "callback_data": f"r:t:{i}"}]
           for i, (name, _) in enumerate(RULES)]
     kb += [[{"text": f"❌ {_rule_label(k, v)[:38]}", "callback_data": f"r:d:{rid}"}] for rid, k, v in custom]
