@@ -65,6 +65,9 @@ ASK = [
 
 SCOPE = "{in:inbox in:spam} -is:starred -in:sent"
 NEVER_DELETE = " ".join(f"-{k}" for k in KEEP + ASK)
+# для правил «по отправителю» защита только самая важная: Gmail кладёт рассылки магазинов
+# и банков в «Покупки», и полная защита не давала их удалять вообще
+NEVER_DELETE_SENDER = " ".join(f"-{k}" for k in KEEP)
 
 # (название для отчёта, запрос Gmail)
 RULES = [
@@ -91,8 +94,17 @@ RULES = [
 DIGEST_QUERY = "in:inbox -is:starred " + " ".join(f"-{k}" for k in KEEP)
 
 
-def rule_query(q: str) -> str:
-    return f"{SCOPE} {NEVER_DELETE} ({q})"
+# встроенные правила, нацеленные на конкретных отправителей
+SENDER_RULES = {
+    "рассылки сервисов",
+    "старые оповещения безопасности Google",
+    "статусы доставки AliExpress",
+    "уведомления Railway",
+}
+
+
+def rule_query(q: str, sender: bool = False) -> str:
+    return f"{SCOPE} {NEVER_DELETE_SENDER if sender else NEVER_DELETE} ({q})"
 
 
 # ---------------------------------------------------------------- состояние
@@ -136,6 +148,10 @@ def init_db() -> None:
         db.execute("ALTER TABLE gmail_items ADD COLUMN email TEXT")
     except sqlite3.OperationalError:
         pass  # колонка уже есть
+    try:
+        db.execute("ALTER TABLE gmail_items ADD COLUMN msg_date INTEGER")
+    except sqlite3.OperationalError:
+        pass
     db.commit()
     _muted.clear()
     _muted.update(r[0] for r in db.execute("SELECT chat_id FROM muted_chats"))
@@ -288,12 +304,17 @@ async def thread_meta(tid: str) -> dict:
         f"/threads/{tid}",
         params=[("format", "metadata"), ("metadataHeaders", "Subject"), ("metadataHeaders", "From")],
     )
+    return _meta_from(data)
+
+
+def _meta_from(data: dict) -> dict:
     msgs = data.get("messages", [])
     first, last = msgs[0], msgs[-1]
     return {
         "subject": _header(first, "Subject") or "(без темы)",
         "sender": _clean_sender(_header(last, "From")),
         "email": _sender_email(_header(last, "From")),
+        "date": int(last.get("internalDate", 0)) // 1000,
         "snippet": html.unescape(last.get("snippet", "")),
     }
 
@@ -393,8 +414,13 @@ def digest_keyboard(tids: list[str], start: int) -> dict:
     return {"inline_keyboard": rows}
 
 
-async def send_digest(limit: int = DIGEST_LIMIT, header: str = "") -> int:
+async def send_digest(limit: int = DIGEST_LIMIT, header: str = "", pre_clean: bool = True) -> int:
     """Подтянуть новые письма в очередь и показать карточку первого."""
+    if pre_clean and kv_get("auto_cleanup") == "1":
+        # сначала убираем всё, что подходит под правила, — чтобы не показывать мусор
+        n, _, _ = await run_cleanup()
+        if n:
+            header += f"🧹 Сначала удалила по правилам: {n}\n\n"
     candidates = await list_threads(DIGEST_QUERY, limit=limit * 4 + 50)
     known = {r[0] for r in db.execute("SELECT thread_id FROM gmail_items")}
     fresh = [t for t in candidates if t not in known][:limit]
@@ -402,9 +428,10 @@ async def send_digest(limit: int = DIGEST_LIMIT, header: str = "") -> int:
     for tid in fresh:
         meta = await thread_meta(tid)
         db.execute(
-            "INSERT OR REPLACE INTO gmail_items (thread_id, status, subject, sender, snippet, created, email) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (tid, "sent", meta["subject"], meta["sender"], meta["snippet"], now, meta.get("email", "")),
+            "INSERT OR REPLACE INTO gmail_items (thread_id, status, subject, sender, snippet, created, email, msg_date) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (tid, "sent", meta["subject"], meta["sender"], meta["snippet"], now, meta.get("email", ""),
+             meta.get("date") or None),
         )
     db.commit()
     if not queue():
@@ -426,8 +453,19 @@ def queue() -> list[str]:
     )]
 
 
+MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+
 def _item(tid: str):
-    return db.execute("SELECT subject, sender, snippet FROM gmail_items WHERE thread_id=?", (tid,)).fetchone()
+    return db.execute("SELECT subject, sender, snippet, msg_date FROM gmail_items WHERE thread_id=?", (tid,)).fetchone()
+
+
+def fmt_date(ts: int | None) -> str:
+    if not ts:
+        return ""
+    d = dt.datetime.fromtimestamp(ts, TZ)
+    year = "" if d.year == dt.datetime.now(TZ).year else f" {d.year}"
+    return f"📅 {d.day} {MONTHS[d.month - 1]}{year}"
 
 
 async def render_card(msg_id: int | None = None, header: str = "", full: bool = False, confirm_all: bool = False) -> None:
@@ -448,8 +486,10 @@ async def render_card(msg_id: int | None = None, header: str = "", full: bool = 
                {"text": "Нет, назад", "callback_data": "c:back"}]]
     else:
         tid = q[0]
-        subject, sender, snippet = _item(tid)
-        top = f"{header}📬 <b>Письмо на разбор</b> · осталось {len(q)}\n\n<b>{html.escape(subject)}</b>\n👤 {html.escape(sender)}\n\n"
+        subject, sender, snippet, msg_date = _item(tid)
+        when = fmt_date(msg_date)
+        top = (f"{header}📬 <b>Письмо на разбор</b> · осталось {len(q)}\n\n<b>{html.escape(subject)}</b>\n"
+               f"👤 {html.escape(sender)}" + (f"   {when}" if when else "") + "\n\n")
         if full:
             try:
                 body = await thread_text(tid)
@@ -506,15 +546,13 @@ async def on_card_callback(cb: dict, data: str, msg_id: int) -> None:
             await answer(cb["id"], "Не вижу адрес отправителя — добавь правило в 📋 Правила", show_alert=True)
             return
         add_rule("from", email)
-        same = [t for (t,) in db.execute(
-            "SELECT thread_id FROM gmail_items WHERE status='sent' AND email=?", (email,))]
-        await trash_many(same)
-        for t in same:
-            set_status(t, "trashed")
+        n = await apply_rule_now("from", email)
+        await gmail("POST", f"/threads/{tid}/trash")  # сама карточка — даже если письмо защищено
+        set_status(tid, "trashed")
         db.execute("DELETE FROM kv WHERE k='last_action'")
         db.commit()
-        await answer(cb["id"], f"🚫 Теперь всё от {email} удаляется автоматически" +
-                     (f" (убрала ещё {len(same) - 1} из очереди)" if len(same) > 1 else ""), show_alert=True)
+        await answer(cb["id"], f"🚫 Всё от {email} теперь удаляется автоматически.\n"
+                     f"Сразу удалила писем: {max(n, 1)}.", show_alert=True)
     elif act == "l":
         # в конец очереди
         db.execute("UPDATE gmail_items SET created=? WHERE thread_id=?", (int(time.time()) + 1, tid))
@@ -568,8 +606,8 @@ async def find_junk() -> tuple[dict[str, int], list[str]]:
     """Письма (не цепочки) под удаление — по правилам, без повторов."""
     counts, all_ids = {}, []
     seen = set()
-    for name, q in active_rules():
-        ids = [m for m in await list_messages(rule_query(q)) if m not in seen]
+    for name, q, sender in active_rules():
+        ids = [m for m in await list_messages(rule_query(q, sender)) if m not in seen]
         seen.update(ids)
         counts[name] = len(ids)
         all_ids += ids
@@ -647,7 +685,7 @@ async def evening() -> None:
             header = f"🧹 Сегодня удалила {n} ненужных писем:\n{counts_text(counts)}\n\n"
         if failed:
             header += f"⚠️ Не удалось удалить {failed}.\n\n"
-    await send_digest(header=header)
+    await send_digest(header=header, pre_clean=False)
 
 
 # ---------------------------------------------------------------- кнопки и команды
@@ -726,7 +764,7 @@ async def on_callback(cb: dict) -> None:
                     "и присылать сводку того, что под вопросом. Вот первая порция:"
                 ),
             )
-        await send_digest()
+        await send_digest(pre_clean=False)
         return
 
     if data == "rest":
@@ -910,10 +948,11 @@ def _rule_query(kind: str, value: str) -> str:
     return f'subject:("{value}")'
 
 
-def active_rules() -> list[tuple[str, str]]:
+def active_rules() -> list[tuple[str, str, bool]]:
+    """(название, запрос, правило-по-отправителю)."""
     off = disabled_rules()
-    rules = [(name, q) for name, q in RULES if name not in off]
-    rules += [(_rule_label(k, v), _rule_query(k, v)) for _, k, v in custom_rules()]
+    rules = [(name, q, name in SENDER_RULES) for name, q in RULES if name not in off]
+    rules += [(_rule_label(k, v), _rule_query(k, v), k == "from") for _, k, v in custom_rules()]
     return rules
 
 
@@ -937,6 +976,19 @@ def clean_rule_value(kind: str, text: str) -> str | None:
         return text
     text = re.sub(r'[()"{}]', "", text)
     return text[:60] if len(text) >= 2 else None
+
+
+async def apply_rule_now(kind: str, value: str) -> int:
+    """Сразу удалить всё, что уже лежит в почте и подходит под новое правило."""
+    ids = await list_messages(rule_query(_rule_query(kind, value), sender=(kind == "from")))
+    n = await trash_messages(ids) if ids else 0
+    # из очереди карточек тоже убираем
+    if kind == "from":
+        rows = db.execute("SELECT thread_id FROM gmail_items WHERE status='sent' AND email LIKE ?",
+                          (f"%{value}",)).fetchall()
+        for (t,) in rows:
+            set_status(t, "trashed")
+    return n
 
 
 def rules_view() -> tuple[str, dict]:
@@ -1014,13 +1066,14 @@ async def receive_rule_input(kind: str, text: str) -> None:
     db.commit()
     added = add_rule(kind, value)
     try:
-        found = len(await list_messages(rule_query(_rule_query(kind, value))))
+        n = await apply_rule_now(kind, value)
     except Exception:
-        found = None
+        log.exception("apply_rule_now")
+        n = None
     msg = (f"✅ Добавила правило: {_rule_label(kind, value)}" if added
            else f"Такое правило уже есть: {_rule_label(kind, value)}")
-    if found is not None:
-        msg += f"\nСейчас под него попадает писем: {found}. Удалятся при следующей чистке."
+    if n is not None:
+        msg += f"\n🗑 Сразу удалила подходящих писем: {n}." if n else "\nСейчас подходящих писем в почте нет."
     await tg("sendMessage", chat_id=owner_id, text=msg, reply_markup=MENU_KB)
     await show_rules()
 

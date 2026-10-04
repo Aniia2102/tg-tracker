@@ -27,7 +27,7 @@ async def run():
     await mail.on_message({"text":"📋 Правила"})
     p=last("sendMessage"); print(p["text"]); print([[b["text"] for b in r] for r in p["reply_markup"]["inline_keyboard"]])
     await cb("r:t:0"); print("toggle ->", last("answerCallbackQuery")["text"], mail.disabled_rules())
-    print("active names:", [n for n,_ in mail.active_rules()][:3])
+    print("active names:", [r[0] for r in mail.active_rules()][:3])
     await cb("r:a:from"); print("prompt:", last("sendMessage")["text"][:50])
     await mail.on_message({"text":"привет мир"}); print("bad:", last("sendMessage")["text"])
     await mail.on_message({"text":"Shop.com"}); print("added:", [p["text"] for m,p in sent[-2:] if m=="sendMessage"][0])
@@ -35,7 +35,7 @@ async def run():
     print("awaiting cancelled:", mail.kv_get("awaiting"))
     await cb("r:a:subject"); await mail.on_message({"text":'"скидка"'})
     print("rules:", mail.custom_rules())
-    print("queries:", [q for n,q in mail.active_rules() if n.startswith(("от","тема"))])
+    print("queries:", [(r[1],r[2]) for r in mail.active_rules() if r[0].startswith(("от","тема"))])
     # card block
     sent.clear(); await mail.send_digest()
     p=last("sendMessage"); print([[b["text"] for b in r] for r in p["reply_markup"]["inline_keyboard"]])
@@ -43,3 +43,7 @@ async def run():
     print("card now:", last("editMessageText")["text"].replace("\n"," / ")[:90])
     await cb("r:d:1"); print("after delete rule:", mail.custom_rules())
 asyncio.run(run())
+q_sender=mail.rule_query("from:(x.com)", sender=True); q_broad=mail.rule_query("category:promotions")
+assert "category:purchases" not in q_sender and "cyber.org.il" in q_sender and "is:starred" in q_sender
+assert "category:purchases" in q_broad
+print("protection levels ok")
