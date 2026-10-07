@@ -11,7 +11,9 @@ tg-tracker — юзербот, который присылает через от
   DB_PATH               — путь к базе (по умолчанию /data/tracker.db)
   RETENTION_DAYS        — сколько дней хранить текст (по умолчанию 30)
   MEDIA_RETENTION_DAYS  — сколько дней хранить медиа (по умолчанию 7)
-  MEDIA_MAX_MB          — не скачивать файлы больше (по умолчанию 20)
+  MEDIA_MAX_MB          — файлы до этого размера шлёт бот (по умолчанию 50 — предел Bot API)
+  MEDIA_BIG_MB          — из личек сохранять и больше, до этого размера; такие уходят
+                          в «Избранное» (по умолчанию 300)
   MEDIA_IN_GROUPS       — 1/0: сохранять медиа из групп (по умолчанию 1)
 """
 
@@ -50,7 +52,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "/data/tracker.db")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 MEDIA_RETENTION_DAYS = int(os.environ.get("MEDIA_RETENTION_DAYS", "7"))
-MEDIA_MAX_BYTES = int(float(os.environ.get("MEDIA_MAX_MB", "20")) * 1024 * 1024)
+# до 50 МБ файл пересылает бот (это предел Bot API);
+# больше — до MEDIA_BIG_MB, только из личек, уходит в «Избранное» от твоего аккаунта
+MEDIA_MAX_BYTES = int(float(os.environ.get("MEDIA_MAX_MB", "50")) * 1024 * 1024)
+MEDIA_BIG_BYTES = int(float(os.environ.get("MEDIA_BIG_MB", "300")) * 1024 * 1024)
+BOT_UPLOAD_LIMIT = 50 * 1024 * 1024
 MEDIA_IN_GROUPS = os.environ.get("MEDIA_IN_GROUPS", "1") == "1"
 
 MEDIA_DIR = Path(DB_PATH).parent / "media"
@@ -277,6 +283,16 @@ async def notify_media(kind: str, path: str, caption: str, chat_id: int | None =
     return ok
 
 
+async def send_big(path: str, caption: str, chat_id: int) -> None:
+    mb = os.path.getsize(path) / 2**20
+    try:
+        await client.send_file("me", path, caption=caption, parse_mode="html", supports_streaming=True)
+        await notify(caption + f"\n\n📁 Файл большой ({mb:.0f} МБ) — сохранила его в «Избранное».", chat_id=chat_id)
+    except Exception:
+        log.exception("send_big")
+        await notify(caption + f"\n\n(файл {mb:.0f} МБ не удалось отправить)", chat_id=chat_id)
+
+
 # ---------------------------------------------------------------- клиент
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
@@ -301,6 +317,10 @@ async def download_media(event, kind: str) -> None:
     """Скачать медиа в фоне и записать путь в базу."""
     msg = event.message
     try:
+        used = sum(f.stat().st_size for f in os.scandir(MEDIA_DIR) if f.is_file())
+        if used + media_size(msg) > MEDIA_DISK_LIMIT:
+            log.warning("Медиа не сохраняю: место для файлов почти закончилось (%.1f ГБ)", used / 2**30)
+            return
         base = MEDIA_DIR / f"{event.chat_id}_{msg.id}"
         path = await client.download_media(msg, file=str(base))
         if not path:
@@ -320,7 +340,8 @@ async def download_media(event, kind: str) -> None:
 
 # загрузки, которые ещё идут: (chat_id, msg_id) -> задача
 pending: dict[tuple[int, int], asyncio.Task] = {}
-DOWNLOAD_WAIT = 60  # сколько ждать загрузку, если сообщение удалили раньше
+DOWNLOAD_WAIT = 300  # сколько ждать загрузку, если сообщение удалили раньше (большие видео)
+MEDIA_DISK_LIMIT = 3.5 * 2**30  # не забивать том больше 3.5 ГБ из 5
 
 
 async def save(event, *, with_media: bool = True) -> None:
@@ -336,10 +357,12 @@ async def save(event, *, with_media: bool = True) -> None:
         username = getattr(sender, "username", None)
 
     kind = media_kind(msg) if with_media else None
-    if kind and (
-        media_size(msg) > MEDIA_MAX_BYTES or (event.is_group and not MEDIA_IN_GROUPS)
-    ):
-        kind = None
+    if kind:
+        size = media_size(msg)
+        limit = MEDIA_MAX_BYTES if event.is_group else max(MEDIA_MAX_BYTES, MEDIA_BIG_BYTES)
+        if size > limit or (event.is_group and not MEDIA_IN_GROUPS):
+            log.info("Медиа %s %.0f МБ не сохраняю (лимит %.0f МБ)", kind, size / 2**20, limit / 2**20)
+            kind = None
 
     db.execute(
         """
@@ -460,10 +483,15 @@ async def on_delete(event):
                 # сам файл уже показывает, что это — убираем метку вроде [фото]
                 body = (text or "").split("] ", 1)[1] if (text or "").startswith("[") and "] " in text else ""
                 caption = head.rstrip() if not body else head + quote(clip(body, MAX_LEN - len(head) - 40))
-                if not await notify_media(kind, path, caption, chat_id=chat_id):
+                if os.path.getsize(path) > BOT_UPLOAD_LIMIT:
+                    # бот не может отправить файл больше 50 МБ — кладём в «Избранное» с твоего аккаунта
+                    await send_big(path, caption, chat_id)
+                elif not await notify_media(kind, path, caption, chat_id=chat_id):
                     await notify(caption + "\n\n(файл не удалось отправить)", chat_id=chat_id)
                 remove_file(path)
             else:
+                if kind:
+                    log.info("Удалено медиа %s без файла (chat %s, msg %s)", kind, chat_id, msg_id)
                 await notify(head + quote(clip(text, MAX_LEN - len(head) - 40)), chat_id=chat_id)
     except Exception:
         log.exception("on_delete")
