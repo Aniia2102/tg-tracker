@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 import aiohttp
-import mail
+import bot
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -303,7 +303,7 @@ async def should_track(event) -> bool:
     """Личка с человеком (не бот) или группа. Свои сообщения — нет."""
     if event.out or event.sender_id == owner_id:
         return False
-    if mail.is_muted(event.chat_id):
+    if bot.is_muted(event.chat_id):
         return False
     if event.is_private:
         if event.chat_id == bot_id:
@@ -475,7 +475,7 @@ async def on_delete(event):
                 "DELETE FROM messages WHERE chat_id=? AND msg_id=?", (chat_id, msg_id)
             )
             db.commit()
-            if sender_id == owner_id or mail.is_muted(chat_id):
+            if sender_id == owner_id or bot.is_muted(chat_id):
                 remove_file(path)
                 continue
             head = f"{who(name, username)} удалил(а) сообщение{where(title)}:\n\n"
@@ -549,9 +549,7 @@ async def main():
     owner_id = me.id
     log.info("Запущен как %s (id %s), база %s", display_name(me), me.id, DB_PATH)
     asyncio.create_task(cleanup_loop())
-    mail.start(http, db, owner_id, BOT_TOKEN, remove_file=remove_file)
-    if not mail.ENABLED:
-        log.info("Почта выключена: нет GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN")
+    bot.start(http, db, owner_id, BOT_TOKEN, remove_file=remove_file)
     try:
         await client.run_until_disconnected()
     finally:
