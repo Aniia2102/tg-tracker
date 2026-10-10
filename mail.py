@@ -8,6 +8,10 @@
   DIGEST_LIMIT  — сколько писем в одной сводке (по умолчанию 30)
   TZ_NAME       — часовой пояс (по умолчанию Asia/Nicosia)
   KEEP_FROM     — доп. отправители, которых не трогать никогда, через запятую
+  MAIL_OFF      — 1: выключить почту здесь (она переехала в отдельный бот life-bots/mail).
+                  Кнопки отключения чатов и /mailexport продолжают работать.
+
+Перенос в новый бот: команда /mailexport присылает файл с правилами и настройками.
 
 Как работает:
   • Правила удаления (RULES) — то, что точно не нужно: промо, соцсети,
@@ -43,7 +47,9 @@ DIGEST_LIMIT = int(os.environ.get("DIGEST_LIMIT", "30"))
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Nicosia"))
 PAGE = 10  # писем в одном сообщении сводки
 
-ENABLED = bool(CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN)
+MAIL_OFF = os.environ.get("MAIL_OFF", "").strip().lower() in ("1", "true", "yes", "on")
+ENABLED = bool(CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN) and not MAIL_OFF
+MOVED_TEXT = "📬 Почта переехала в отдельный почтовый бот — сводка и кнопки теперь там."
 
 API = "https://gmail.googleapis.com/gmail/v1/users/me"
 
@@ -725,7 +731,7 @@ async def on_callback(cb: dict) -> None:
     if await on_chat_callback(cb, data, msg_id):
         return
     if not ENABLED:
-        await answer(cb["id"], "Почта не подключена")
+        await answer(cb["id"], MOVED_TEXT if MAIL_OFF else "Почта не подключена", show_alert=MAIL_OFF)
         return
     if data.startswith("c:"):
         await on_card_callback(cb, data, msg_id)
@@ -1081,6 +1087,60 @@ async def receive_rule_input(kind: str, text: str) -> None:
     await show_rules()
 
 
+# ---------------------------------------------------------------- экспорт для переезда
+
+EXPORT_KV = ("auto_cleanup", "auto_read", "disabled_rules", "welcomed", "initial_read")
+EXPORT_ITEM_COLS = ("thread_id", "status", "subject", "sender", "snippet", "created", "email", "msg_date")
+
+
+def export_state() -> dict:
+    """Всё, что нужно новому почтовому боту: правила, настройки, разобранные письма."""
+    return {
+        "kind": "tg-tracker-mail-export",
+        "version": 1,
+        "exported_at": int(time.time()),
+        "owner_id": owner_id,
+        "digest_hour": DIGEST_HOUR,
+        "tz": TZ.key,
+        "kv": {k: v for k in EXPORT_KV if (v := kv_get(k)) is not None},
+        "custom_rules": [
+            {"kind": k, "value": v, "created": c}
+            for k, v, c in db.execute("SELECT kind, value, created FROM custom_rules ORDER BY id")
+        ],
+        "gmail_items": [
+            dict(zip(EXPORT_ITEM_COLS, r))
+            for r in db.execute(f"SELECT {', '.join(EXPORT_ITEM_COLS)} FROM gmail_items")
+        ],
+    }
+
+
+async def tg_file(method: str, field: str, filename: str, content: bytes, **payload):
+    form = aiohttp.FormData()
+    for k, v in payload.items():
+        form.add_field(k, json.dumps(v) if isinstance(v, (dict, list)) else str(v))
+    form.add_field(field, content, filename=filename, content_type="application/json")
+    async with http.post(f"https://api.telegram.org/bot{bot_token}/{method}", data=form) as r:
+        data = await r.json()
+    if not data.get("ok"):
+        log.warning("TG %s: %s", method, data)
+    return data.get("result")
+
+
+async def send_export() -> None:
+    state = export_state()
+    content = json.dumps(state, ensure_ascii=False, indent=1).encode("utf-8")
+    await tg_file(
+        "sendDocument", "document", "mail_export.json", content,
+        chat_id=owner_id, parse_mode="HTML",
+        caption=(
+            "📦 Настройки почты для переезда\n"
+            f"Своих правил: {len(state['custom_rules'])}, писем в истории: {len(state['gmail_items'])}.\n\n"
+            f"Твой Telegram ID: <code>{owner_id}</code> — впиши его в OWNER_ID нового сервиса.\n"
+            "Потом перешли этот файл новому почтовому боту."
+        ),
+    )
+
+
 # ---------------------------------------------------------------- отключённые чаты
 
 _muted: set[int] = set()
@@ -1250,8 +1310,12 @@ async def on_message(m: dict) -> None:
     if text in ("/start", "/help", "/menu", BTN_HELP):
         await show_menu()
         return
+    if text == "/mailexport":
+        await send_export()
+        return
     if not ENABLED:
-        await tg("sendMessage", chat_id=owner_id, text="📭 Почта не подключена (нет переменных GMAIL_… на Railway).")
+        await tg("sendMessage", chat_id=owner_id,
+                 text=MOVED_TEXT if MAIL_OFF else "📭 Почта не подключена (нет переменных GMAIL_… на Railway).")
         return
     awaiting = kv_get("awaiting")
     if awaiting and text and not text.startswith("/") and text not in ALL_BUTTONS:
@@ -1384,6 +1448,8 @@ def start(session: aiohttp.ClientSession, database: sqlite3.Connection, owner: i
         _remove_file = remove_file
     init_db()
     tasks = [asyncio.create_task(updates_loop()), asyncio.create_task(setup_menu())]
+    if MAIL_OFF:
+        log.info("Почта выключена здесь (MAIL_OFF=1): работает в отдельном боте")
     if ENABLED:
         log.info("Почта включена: сводка в %02d:00 (%s)", DIGEST_HOUR, TZ.key)
         tasks += [asyncio.create_task(scheduler_loop()), asyncio.create_task(auto_read_loop())]

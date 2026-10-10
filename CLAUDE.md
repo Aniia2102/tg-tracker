@@ -35,6 +35,9 @@ Anna только описывает, что нужно. В боте нет ИИ
 `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`.
 Необязательные: `DIGEST_HOUR`, `DIGEST_LIMIT`, `TZ_NAME`, `KEEP_FROM`, `RETENTION_DAYS`,
 `MEDIA_RETENTION_DAYS`, `MEDIA_MAX_MB`, `MEDIA_IN_GROUPS`.
+`MAIL_OFF=1` — выключить почту здесь (переезд в `life-bots/mail/`): Gmail не трогается,
+кнопки почты отвечают «переехала», отключение чатов работает. `/mailexport` — файл
+с правилами и настройками почты для нового бота (работает всегда).
 Секреты вписывает только Anna — никогда не просить их в чат.
 
 ## Деплой

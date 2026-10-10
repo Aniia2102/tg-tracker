@@ -550,7 +550,7 @@ async def main():
     log.info("Запущен как %s (id %s), база %s", display_name(me), me.id, DB_PATH)
     asyncio.create_task(cleanup_loop())
     mail.start(http, db, owner_id, BOT_TOKEN, remove_file=remove_file)
-    if not mail.ENABLED:
+    if not mail.ENABLED and not mail.MAIL_OFF:
         log.info("Почта выключена: нет GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN")
     try:
         await client.run_until_disconnected()
