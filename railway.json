@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "python export_mail.py 1082739603",
+    "startCommand": "sleep infinity",
     "restartPolicyType": "ALWAYS"
   }
 }
